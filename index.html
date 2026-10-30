@@ -88,7 +88,7 @@ canvas{image-rendering:auto}
 </div>
 
 <p class="info-text" style="text-align:center;margin-top:24px">
-  支持 B站 / 小红书链接 · 容量最大约 100 字节<br>
+  支持 B站 / 小红书链接 · 容量最大约 139 字节<br>
   完全离线运行，数据不离开浏览器
 </p>
 </div>
@@ -311,7 +311,8 @@ class RSCodec {
 function seededRandom(seed) {
   let s = seed | 0;
   return function() {
-    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    // Math.imul keeps the multiply in 32-bit, matching Python's exact ints
+    s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
     return s / 0x7fffffff;
   };
 }
@@ -329,13 +330,16 @@ function fisherYatesShuffle(arr, rng) {
 const DEFAULT_IMAGE_SIZE = 1024;
 const DEFAULT_EC = 30;
 const DEFAULT_SEED = 42;
-const VERSION_HEADER = [0x53, 0x53, 0x4D, 0x35]; // 'SSM5'
+const VERSION_HEADER = [0x53, 0x53, 0x4D, 0x36]; // 'SSM6'
 const REPEAT = 5;
+const WHITEN_SEED = 7;
 const RING_OUTER_RATIO = 0.46;
 const RING_INNER_RATIO = 0.16;
 const SESAME_SPACING = 9.0;
 const METADATA_BYTES = 3;
-const VERSION_TABLE = {1: 30, 2: 70, 3: 142};
+const SESAME_PRESENT_MIN = 205;
+const SESAME_ABSENT_MAX = 192;
+const VERSION_TABLE = {1: 30, 2: 70, 3: 144};
 
 function getRingParams(imageSize) {
   const half = Math.floor(imageSize / 2);
@@ -386,6 +390,13 @@ const CANONICAL_GRID_COUNT = buildPolarGrid(
 const N_TOTAL_LOGICAL = Math.floor(CANONICAL_GRID_COUNT / REPEAT);
 const N_PHYSICAL = N_TOTAL_LOGICAL * REPEAT;
 
+function whiteningSequence(n) {
+  const rng = seededRandom(WHITEN_SEED);
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) out[i] = rng() < 0.5 ? 1 : 0;
+  return out;
+}
+
 // ============================================================
 // Sector Interleaver
 // ============================================================
@@ -400,7 +411,9 @@ class SectorInterleaver {
       angles.push(Math.atan2(grid[i].y - cy, grid[i].x - cx));
     const sectors = Array.from({length: repeat}, () => []);
     for (let i = 0; i < angles.length; i++) {
-      const s = Math.floor((angles[i] + Math.PI) / (2 * Math.PI) * repeat) % repeat;
+      // +1e-6 keeps cells exactly on a sector boundary assigned
+      // identically despite 1-ulp trig differences across languages
+      const s = Math.floor((angles[i] + Math.PI) / (2 * Math.PI) * repeat + 1e-6) % repeat;
       sectors[s].push(i);
     }
     const rng = seededRandom(seed);
@@ -513,10 +526,10 @@ function drawBagel(ctx, size, cx, cy, outer_r, inner_r, seed) {
       if (dist < outer_r && dist > inner_r) {
         const t = (dist - inner_r) / (outer_r - inner_r);
         const shade = Math.max(0, Math.min(1, 0.55 + 0.45 * Math.sin(t * Math.PI)));
-        const noise = (rng() - 0.5) * 16;
-        d[idx]   = Math.max(0, Math.min(255, Math.round(235*shade+20+noise)));
-        d[idx+1] = Math.max(0, Math.min(255, Math.round(155*shade+40+noise)));
-        d[idx+2] = Math.max(0, Math.min(255, Math.round(175*shade+45+noise)));
+        const noise = (rng() - 0.5) * 12;
+        d[idx]   = Math.max(0, Math.min(255, Math.round(205*shade+20+noise)));
+        d[idx+1] = Math.max(0, Math.min(255, Math.round(118*shade+28+noise)));
+        d[idx+2] = Math.max(0, Math.min(255, Math.round(138*shade+32+noise)));
         d[idx+3] = 255;
       } else if (dist <= inner_r) {
         d[idx]=245; d[idx+1]=230; d[idx+2]=235; d[idx+3]=255;
@@ -526,7 +539,7 @@ function drawBagel(ctx, size, cx, cy, outer_r, inner_r, seed) {
     }
   }
   ctx.putImageData(imgData, 0, 0);
-  ctx.strokeStyle = 'rgb(180,100,120)';
+  ctx.strokeStyle = 'rgb(170,90,110)';
   ctx.lineWidth = 2;
   for (let off = 0; off < 2; off++) {
     ctx.beginPath(); ctx.arc(cx, cy, outer_r-off, 0, 2*Math.PI); ctx.stroke();
@@ -534,37 +547,42 @@ function drawBagel(ctx, size, cx, cy, outer_r, inner_r, seed) {
   }
 }
 
-function drawSesame(ctx, x, y, bit, rotation) {
-  const sz = 11;
-  ctx.save();
-  ctx.translate(x, y);
-  ctx.rotate(rotation * Math.PI / 180);
-  const w = sz, h = Math.round(sz * 0.55);
-  // Base ellipse
-  ctx.beginPath();
-  ctx.ellipse(0, 0, w/2, h/2, 0, 0, 2*Math.PI);
-  if (bit === 0) {
-    ctx.fillStyle = `rgb(${Math.round(235*0.35)},${Math.round(220*0.30)},${Math.round(170*0.25)})`;
-  } else {
-    ctx.fillStyle = `rgb(${235+5},${220+5},${170+5})`;
+// White teardrop sesame: sharp tip aimed at the bagel center
+const SESAME_TIP_LEN = 6.0;
+const SESAME_BODY_A = 4.5;
+const SESAME_BODY_B = 2.8;
+
+function teardropPoints(x, y, ux, uy, tipLen, a, b) {
+  const vx = -uy, vy = ux;
+  const pts = [[x + ux * tipLen, y + uy * tipLen]];
+  for (let deg = 40; deg <= 320; deg += 20) {
+    const ar = deg * Math.PI / 180;
+    const ca = Math.cos(ar), sa = Math.sin(ar);
+    pts.push([x + ux * (a * ca) + vx * (b * sa),
+              y + uy * (a * ca) + vy * (b * sa)]);
   }
-  ctx.fill();
-  // Highlight
+  return pts;
+}
+
+function fillTeardrop(ctx, pts) {
   ctx.beginPath();
-  ctx.ellipse(0, -h*0.15, w*0.25, h*0.2, 0, 0, 2*Math.PI);
-  if (bit === 0) {
-    ctx.fillStyle = `rgb(${Math.round(248*0.35)},${Math.round(238*0.30)},${Math.round(205*0.25)})`;
-  } else {
-    ctx.fillStyle = `rgb(${Math.min(255,253)},${Math.min(255,243)},${Math.min(255,210)})`;
-  }
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath();
   ctx.fill();
-  // Outline
-  ctx.beginPath();
-  ctx.ellipse(0, 0, w/2, h/2, 0, 0, 2*Math.PI);
-  ctx.strokeStyle = 'rgba(185,165,110,0.5)';
-  ctx.lineWidth = 0.8;
+}
+
+function drawSesame(ctx, x, y, angleToCenter) {
+  const ux = Math.cos(angleToCenter), uy = Math.sin(angleToCenter);
+  ctx.fillStyle = 'rgb(240,228,190)';
+  fillTeardrop(ctx, teardropPoints(x, y, ux, uy, SESAME_TIP_LEN, SESAME_BODY_A, SESAME_BODY_B));
+  ctx.strokeStyle = 'rgb(205,190,145)';
+  ctx.lineWidth = 1;
   ctx.stroke();
-  ctx.restore();
+  const hx = x - ux * 1.0, hy = y - uy * 1.0;
+  ctx.fillStyle = 'rgb(252,246,222)';
+  fillTeardrop(ctx, teardropPoints(hx, hy, ux, uy,
+    SESAME_TIP_LEN * 0.45, SESAME_BODY_A * 0.45, SESAME_BODY_B * 0.42));
 }
 
 // ============================================================
@@ -578,8 +596,8 @@ function encodeToCanvas(text, canvas) {
   const rs = new RSCodec(DEFAULT_EC);
   const grid = buildPolarGrid(cx, cy, inner_r+4, outer_r-4, SESAME_SPACING);
 
-  const totalBytes = Math.floor(Math.floor(grid.length / REPEAT) / 8);
-  const overhead = METADATA_BYTES + 4 + DEFAULT_EC;
+  const totalBytes = Math.floor(N_TOTAL_LOGICAL / 8);
+  const overhead = METADATA_BYTES + VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
   const capacity = Math.max(0, totalBytes - overhead);
   if (data.length > capacity) throw new Error(`数据过长: ${data.length} 字节, 最大 ${capacity}`);
 
@@ -606,9 +624,11 @@ function encodeToCanvas(text, canvas) {
   const dataBits = [];
   for (const b of encoded) for (let i = 7; i >= 0; i--) dataBits.push((b>>i)&1);
 
-  // Combine meta + data + padding
+  // Combine meta + data + padding, then whiten for ~50% sesame density
   const allLogical = [...metaBits, ...dataBits];
   while (allLogical.length < N_TOTAL_LOGICAL) allLogical.push(0);
+  const whit = whiteningSequence(N_TOTAL_LOGICAL);
+  for (let i = 0; i < N_TOTAL_LOGICAL; i++) allLogical[i] ^= whit[i];
 
   // Repeat
   const physicalBits = [];
@@ -618,14 +638,15 @@ function encodeToCanvas(text, canvas) {
   const interleaver = new SectorInterleaver(grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
   const scattered = interleaver.interleave(physicalBits);
 
-  // Render
+  // Render: sesame ONLY where bit==1, tip aimed at the center
   canvas.width = sz; canvas.height = sz;
   const ctx = canvas.getContext('2d');
   drawBagel(ctx, sz, cx, cy, outer_r, inner_r, DEFAULT_SEED);
 
-  const rng = seededRandom(DEFAULT_SEED + 1);
   for (let i = 0; i < Math.min(N_PHYSICAL, grid.length); i++) {
-    drawSesame(ctx, grid[i].x, grid[i].y, scattered[i], -60 + rng() * 120);
+    if (scattered[i] !== 1) continue;
+    const angle = Math.atan2(cy - grid[i].y, cx - grid[i].x);
+    drawSesame(ctx, grid[i].x, grid[i].y, angle);
   }
 }
 
@@ -654,7 +675,9 @@ function decodeFromImage(imgElement) {
   // Normalize to canonical space
   const ccx = DEFAULT_IMAGE_SIZE/2, ccy = DEFAULT_IMAGE_SIZE/2;
   const cp = getRingParams(DEFAULT_IMAGE_SIZE);
-  const scale = cp.outer_r / Math.max(circle.detectedOuterR, 1);
+  // Scale from seed-ring radii stays correct when the rim is cropped/damaged
+  const ringScale = estimateScaleFromRings(px, w, h, circle.ccx, circle.ccy, circle.detectedInnerR);
+  const scale = ringScale !== null ? ringScale : cp.outer_r / Math.max(circle.detectedOuterR, 1);
   const nc = document.createElement('canvas');
   nc.width = DEFAULT_IMAGE_SIZE; nc.height = DEFAULT_IMAGE_SIZE;
   const nctx = nc.getContext('2d');
@@ -682,64 +705,59 @@ function decodeFromImage(imgElement) {
   }
 
   const grid = buildPolarGrid(ccx, ccy, cp.inner_r+4, cp.outer_r-4, SESAME_SPACING, CANONICAL_GRID_COUNT);
-  const rawValues = readTrinary(grid, cBri);
+  const damage = borderWhiteMask(cdata, DEFAULT_IMAGE_SIZE);
+  const rawValues = readPresence(grid, cBri, damage);
 
   // Use the SAME interleaver size as encoder (full grid)
   const rs = new RSCodec(DEFAULT_EC);
   const fullInterleaver = new SectorInterleaver(grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
   const allOrdered = fullInterleaver.deinterleaveWithErasures(rawValues.slice(0, N_PHYSICAL));
 
+  // Majority vote per REPEAT group, then de-whiten
+  const whit = whiteningSequence(N_TOTAL_LOGICAL);
+  const logical = [], logicalErased = [];
+  for (let g = 0; g < N_TOTAL_LOGICAL; g++) {
+    const group = allOrdered.slice(g*REPEAT, (g+1)*REPEAT);
+    const ones = group.filter(v=>v===1).length;
+    const zeros = group.filter(v=>v===0).length;
+    const nones = group.filter(v=>v===null||v===undefined).length;
+    const b = ones > zeros ? 1 : (zeros > ones ? 0 : whit[g]);
+    logical.push(b ^ whit[g]);
+    logicalErased.push(nones >= 3);
+  }
+
   // Try metadata-guided decode
-  const result = tryDecodeWithOrdered(allOrdered, rs);
+  const result = tryDecodeWithLogical(logical, logicalErased, rs);
   if (result) return result;
 
   // Exhaustive fallback
-  return exhaustiveDecode(allOrdered, rs);
+  return exhaustiveDecode(logical, logicalErased, rs);
 }
 
-function tryDecodeWithOrdered(ordered, rs) {
-  const METADATA_PHYSICAL = METADATA_BYTES * 8 * REPEAT;
-  const metaLogicalCount = METADATA_BYTES * 8;
-  const metaBits = [];
-  for (let g = 0; g < metaLogicalCount; g++) {
-    const group = ordered.slice(g*REPEAT, (g+1)*REPEAT);
-    const ones = group.filter(v=>v===1).length;
-    const zeros = group.filter(v=>v===0).length;
-    metaBits.push(ones > zeros ? 1 : 0);
-  }
+function tryDecodeWithLogical(logical, logicalErased, rs) {
+  const metaBits = logical.slice(0, METADATA_BYTES * 8);
   let v = 0, pl = 0;
   for (let j = 0; j < 8; j++) v = (v<<1)|metaBits[j];
   for (let j = 0; j < 16; j++) pl = (pl<<1)|metaBits[8+j];
   if (!VERSION_TABLE[v] || pl > VERSION_TABLE[v]) return null;
-  return decodePayload(ordered, rs, pl);
+  return decodePayloadLogical(logical, logicalErased, rs, pl);
 }
 
-function decodePayload(ordered, rs, payloadLen) {
+function decodePayloadLogical(logical, logicalErased, rs, payloadLen) {
   const overheadBytes = VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
   const dataLogicalBytes = overheadBytes + payloadLen;
-  const dataStartLogical = METADATA_BYTES * 8;
-  const dataEndLogical = dataStartLogical + dataLogicalBytes * 8;
+  const start = METADATA_BYTES * 8;
+  const end = start + dataLogicalBytes * 8;
+  if (end > logical.length) return null;
 
-  if (dataEndLogical * REPEAT > N_PHYSICAL) return null;
-
-  const logicalBits = [], bitErased = [];
-  for (let g = dataStartLogical; g < dataEndLogical; g++) {
-    const group = ordered.slice(g*REPEAT, (g+1)*REPEAT);
-    const ones = group.filter(v=>v===1).length;
-    const zeros = group.filter(v=>v===0).length;
-    const nones = group.filter(v=>v===null||v===undefined).length;
-    logicalBits.push(ones > zeros ? 1 : 0);
-    bitErased.push(nones === REPEAT);
-  }
-
-  const tryBytes = Math.floor(logicalBits.length / 8);
-  const dataBytes = new Uint8Array(tryBytes);
+  const dataBytes = new Uint8Array(dataLogicalBytes);
   const erasureBytePos = [];
-  for (let i = 0; i < tryBytes; i++) {
+  for (let i = 0; i < dataLogicalBytes; i++) {
     let val = 0, hasE = false;
     for (let j = 0; j < 8; j++) {
-      val = (val<<1)|logicalBits[i*8+j];
-      if (bitErased[i*8+j]) hasE = true;
+      const k = start + i*8 + j;
+      val = (val<<1)|logical[k];
+      if (logicalErased[k]) hasE = true;
     }
     dataBytes[i] = val;
     if (hasE) erasureBytePos.push(i);
@@ -752,6 +770,7 @@ function decodePayload(ordered, rs, payloadLen) {
   for (let i = 0; i < hl; i++) if (decoded[i] !== VERSION_HEADER[i]) return null;
 
   const dpl = (decoded[hl]<<8)|decoded[hl+1];
+  if (dpl !== payloadLen) return null;
   const ps = hl+2, pe = ps+dpl;
   if (pe+4 > decoded.length) return null;
 
@@ -767,11 +786,11 @@ function decodePayload(ordered, rs, payloadLen) {
   return new TextDecoder().decode(payload);
 }
 
-function exhaustiveDecode(ordered, rs) {
+function exhaustiveDecode(logical, logicalErased, rs) {
   const overhead = VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
   const maxPayload = Math.floor(N_TOTAL_LOGICAL/8) - METADATA_BYTES - overhead;
   for (let guess = 5; guess <= Math.min(250, maxPayload); guess++) {
-    const r = decodePayload(ordered, rs, guess);
+    const r = decodePayloadLogical(logical, logicalErased, rs, guess);
     if (r) return r;
   }
   return null;
@@ -790,17 +809,23 @@ function detectBagelCircle(w, h, getBri) {
 
   for (const {cx:icx,cy:icy} of candidates) {
     let ccx=icx,ccy=icy,outerR=null,innerR=null;
+    let lastOuterCount=0;
     for (let iter=0;iter<5;iter++) {
       const nA=180,outerPts=[],innerPts=[];
       for (let ai=0;ai<nA;ai++) {
         const ang=2*Math.PI*ai/nA,dx=Math.cos(ang),dy=Math.sin(ang);
-        let prev=null;
+        // Outer edge: dark->bright transition preceded by a long dark run
+        // (the bagel body). Short dark runs are sesame seeds, not the rim.
+        let darkRun=0;
         for (let r=5;r<Math.min(w,h)/2;r++) {
           const px=Math.round(ccx+r*dx),py=Math.round(ccy+r*dy);
           if (px<0||px>=w||py<0||py>=h) break;
           const b=getBri(px,py);
-          if (prev!==null&&prev<220&&b>240) { outerPts.push({x:ccx+r*dx,y:ccy+r*dy});break; }
-          prev=b;
+          if (b<220) { darkRun++; }
+          else {
+            if (darkRun>=30 && b>240) { outerPts.push({x:ccx+r*dx,y:ccy+r*dy}); break; }
+            darkRun=0;
+          }
         }
         const cb=getBri(Math.round(ccx),Math.round(ccy));
         for (let r=1;r<300;r++) {
@@ -810,33 +835,18 @@ function detectBagelCircle(w, h, getBri) {
         }
       }
       if (outerPts.length<6) break;
+      lastOuterCount=outerPts.length;
       const f=fitCircleRobust(outerPts);
       ccx=f.cx;ccy=f.cy;outerR=f.r;
       if (innerPts.length>=6) { const fi=fitCircleRobust(innerPts);innerR=fi.r; }
       else innerR=Math.max(1,outerR*RING_INNER_RATIO/RING_OUTER_RATIO);
     }
-    if (outerR && outerPts_count(ccx,ccy,outerR,w,h,getBri) > bestCount) {
-      bestCount = outerPts_count(ccx,ccy,outerR,w,h,getBri);
-      best = {ccx,ccy,detectedOuterR:outerR,detectedInnerR:outerR*RING_INNER_RATIO/RING_OUTER_RATIO};
+    if (outerR && lastOuterCount > bestCount) {
+      bestCount = lastOuterCount;
+      best = {ccx,ccy,detectedOuterR:outerR,detectedInnerR:innerR||outerR*RING_INNER_RATIO/RING_OUTER_RATIO};
     }
   }
   return best;
-}
-
-function outerPts_count(cx,cy,r,w,h,getBri) {
-  let count=0;
-  for (let ai=0;ai<90;ai++) {
-    const ang=2*Math.PI*ai/90,dx=Math.cos(ang),dy=Math.sin(ang);
-    let prev=null;
-    for (let ri=5;ri<Math.min(w,h)/2;ri++) {
-      const px=Math.round(cx+ri*dx),py=Math.round(cy+ri*dy);
-      if (px<0||px>=w||py<0||py>=h) break;
-      const b=getBri(px,py);
-      if (prev!==null&&prev<220&&b>240) { count++;break; }
-      prev=b;
-    }
-  }
-  return count;
 }
 
 function fitCircle(points) {
@@ -870,21 +880,116 @@ function fitCircleRobust(points, maxIter=5) {
   return pts.length>=6 ? fitCircle(pts) : fitCircle(points);
 }
 
-function readTrinary(grid, getBri) {
+function readPresence(grid, getBri, damage) {
+  const S = DEFAULT_IMAGE_SIZE;
   const values = [];
   for (const {x,y} of grid) {
     const ix=Math.round(x),iy=Math.round(y);
-    let sum=0,cnt=0;
+    let sum=0,cnt=0,dmg=false;
     for (let dy=-2;dy<=2;dy++) for (let dx=-2;dx<=2;dx++) {
       const px=ix+dx,py=iy+dy;
-      if (px>=0&&py>=0&&px<DEFAULT_IMAGE_SIZE&&py<DEFAULT_IMAGE_SIZE) { sum+=getBri(px,py);cnt++; }
+      if (px>=0&&py>=0&&px<S&&py<S) {
+        sum+=getBri(px,py); cnt++;
+        if (damage[py*S+px]) dmg=true;
+      }
     }
     const b = cnt>0 ? sum/cnt : 128;
-    if (b<110) values.push(0);
-    else if (b>190) values.push(1);
+    if (b >= SESAME_PRESENT_MIN) {
+      // Bright cell overlapping border-connected white damage is unreliable
+      values.push(dmg ? null : 1);
+    }
+    else if (b <= SESAME_ABSENT_MAX) values.push(0);
     else values.push(null);
   }
   return values;
+}
+
+function borderWhiteMask(cdata, S) {
+  const mask = new Uint8Array(S*S);
+  const stack = [];
+  const bri = i => (cdata[i*4]+cdata[i*4+1]+cdata[i*4+2])/3;
+  const push = (x,y) => { const i=y*S+x; if (bri(i)>=250 && !mask[i]) { mask[i]=1; stack.push(i); } };
+  for (let x=0;x<S;x++) { push(x,0); push(x,S-1); }
+  for (let y=0;y<S;y++) { push(0,y); push(S-1,y); }
+  while (stack.length) {
+    const i = stack.pop();
+    const x = i%S, y = (i-x)/S;
+    if (x>0) push(x-1,y);
+    if (x<S-1) push(x+1,y);
+    if (y>0) push(x,y-1);
+    if (y<S-1) push(x,y+1);
+  }
+  return mask;
+}
+
+// Match observed seed-ring radii against canonical ring radii to recover
+// the image scale; robust when the outer rim is cropped or damaged.
+function estimateScaleFromRings(px, w, h, cx, cy, innerREst) {
+  const bri = (x,y) => {
+    x=Math.max(0,Math.min(w-1,x)); y=Math.max(0,Math.min(h-1,y));
+    const i=(y*w+x)*4;
+    return (px[i]+px[i+1]+px[i+2])/3;
+  };
+  const ci = Math.round(innerREst);
+  const rMax = Math.floor(Math.min(w,h)/2)-2;
+  if (rMax <= ci+10) return null;
+
+  const nA = 180;
+  const rads = [];
+  for (let r=ci+3;r<rMax;r++) rads.push(r);
+  const counts = new Float64Array(rads.length);
+  for (let ai=0;ai<nA;ai++) {
+    const ang=2*Math.PI*ai/nA, dx=Math.cos(ang), dy=Math.sin(ang);
+    for (let k=0;k<rads.length;k++) {
+      const x=Math.round(cx+rads[k]*dx), y=Math.round(cy+rads[k]*dy);
+      if (x<0||x>=w||y<0||y>=h) continue;
+      if (bri(x,y)>=210) counts[k]++;
+    }
+  }
+
+  const peaks = [];
+  let i = 0;
+  while (i < rads.length) {
+    if (counts[i] >= 0.2*nA) {
+      let j = i+1;
+      while (j < rads.length && counts[j] >= 0.2*nA) j++;
+      let total=0, wsum=0;
+      for (let k=i;k<j;k++) { total+=counts[k]; wsum+=rads[k]*counts[k]; }
+      if (total>0) peaks.push(wsum/total);
+      i = j;
+    } else i++;
+  }
+  if (peaks.length < 8) return null;
+
+  const cp = getRingParams(DEFAULT_IMAGE_SIZE);
+  const nRings = Math.max(1, Math.floor((cp.outer_r - cp.inner_r - 8) / SESAME_SPACING));
+  const step = (cp.outer_r - cp.inner_r - 8) / nRings;
+  const ringR = [];
+  for (let k=0;k<nRings;k++) ringR.push(cp.inner_r + 4 + step*(k+0.5));
+
+  const scoreScale = s => {
+    let score = 0;
+    for (const p of peaks) {
+      const rc = p/s;
+      let d = Infinity;
+      for (const rr of ringR) { const dd=Math.abs(rc-rr); if (dd<d) d=dd; }
+      if (d <= 2.0) score += 1.0 - d/2.0;
+    }
+    return score;
+  };
+
+  let bestScore=-1, bestS=1;
+  for (let si=500; si<=2000; si+=10) {
+    const sc = scoreScale(si/1000);
+    if (sc > bestScore) { bestScore=sc; bestS=si/1000; }
+  }
+  const base = Math.round(bestS*1000);
+  for (let si=base-9; si<=base+9; si+=2) {
+    const sc = scoreScale(si/1000);
+    if (sc > bestScore) { bestScore=sc; bestS=si/1000; }
+  }
+  if (bestScore < 0.5*peaks.length) return null;
+  return bestS;
 }
 
 // ============================================================

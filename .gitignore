@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+_test.png
+test_bilibili_full.png
+test_bilibili_short.png
+test_short_ascii.png
+test_xiaohongshu.png
+assets/
+download_assets.py
