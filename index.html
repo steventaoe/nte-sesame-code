@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>异环 · 芝码生成器</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--pink:#E891A5;--pink-dark:#D4707E;--pink-light:#F5C6D0;--bg:#FFF5F7;--text:#3A2030;--card:#FFFFFF;--border:#F0D0D8;--shadow:0 4px 24px rgba(200,100,130,0.12)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;flex-direction:column;align-items:center}
+.container{max-width:640px;width:100%;padding:20px}
+h1{text-align:center;font-size:1.6em;margin:24px 0 8px;color:var(--pink-dark);letter-spacing:2px}
+.subtitle{text-align:center;font-size:0.85em;color:#B07080;margin-bottom:24px}
+.tabs{display:flex;gap:0;margin-bottom:20px;background:var(--card);border-radius:12px;overflow:hidden;box-shadow:var(--shadow)}
+.tab{flex:1;padding:14px;text-align:center;cursor:pointer;font-size:1em;font-weight:600;color:#A07080;border:none;background:transparent;transition:all .2s}
+.tab.active{background:var(--pink);color:#fff}
+.tab:hover:not(.active){background:var(--pink-light)}
+.panel{display:none;background:var(--card);border-radius:16px;padding:24px;box-shadow:var(--shadow)}
+.panel.active{display:block}
+label{display:block;font-weight:600;margin-bottom:6px;font-size:0.9em}
+input[type=text],input[type=url]{width:100%;padding:12px 16px;border:2px solid var(--border);border-radius:10px;font-size:1em;outline:none;transition:border-color .2s}
+input:focus{border-color:var(--pink)}
+.platform-indicator{font-size:0.8em;margin-top:6px;padding:4px 10px;border-radius:6px;display:inline-block}
+.platform-bilibili{background:#D4E9FF;color:#00A1D6}
+.platform-xiaohongshu{background:#FFE0E0;color:#FE2C55}
+.platform-other{background:#EEE;color:#888}
+.btn{display:inline-block;padding:12px 28px;background:var(--pink);color:#fff;border:none;border-radius:10px;font-size:1em;font-weight:600;cursor:pointer;transition:background .2s;margin-top:16px}
+.btn:hover{background:var(--pink-dark)}
+.btn:disabled{background:#CCC;cursor:not-allowed}
+.btn-secondary{background:#F0E0E4;color:var(--pink-dark)}
+.btn-secondary:hover{background:#E8D0D4}
+.preview-area{text-align:center;margin-top:20px}
+.preview-area canvas,.preview-area img{max-width:100%;border-radius:12px;box-shadow:var(--shadow)}
+.drop-zone{border:3px dashed var(--border);border-radius:16px;padding:48px 20px;text-align:center;cursor:pointer;transition:all .2s;position:relative}
+.drop-zone.dragover{border-color:var(--pink);background:rgba(232,145,165,0.06)}
+.drop-zone input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.drop-zone p{color:#A07080;font-size:0.95em}
+.drop-zone .icon{font-size:2.5em;margin-bottom:8px}
+.result-box{margin-top:16px;padding:16px;background:#FFF8F0;border-radius:10px;border:1px solid #F0D8C0;word-break:break-all}
+.result-box a{color:var(--pink-dark);font-weight:600}
+.error-msg{color:#D44;margin-top:10px;font-size:0.9em}
+.info-text{font-size:0.8em;color:#A08090;margin-top:12px}
+.actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.hidden{display:none}
+.status{font-size:0.85em;color:#A07080;margin-top:10px;min-height:1.2em}
+canvas{image-rendering:auto}
+@media(max-width:480px){.container{padding:12px}h1{font-size:1.3em}.panel{padding:16px}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>异环 · 芝码生成器</h1>
+<p class="subtitle">Spiral Sesame Code — 贝果上的芝麻密码</p>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('encode')">生成芝码</button>
+  <button class="tab" onclick="switchTab('decode')">扫描芝码</button>
+</div>
+
+<div id="encode-panel" class="panel active">
+  <label for="url-input">输入链接</label>
+  <input type="url" id="url-input" placeholder="https://www.bilibili.com/video/BV1xx..." oninput="checkPlatform()">
+  <div id="platform-tag"></div>
+  <button class="btn" id="encode-btn" onclick="doEncode()">生成芝码</button>
+  <div id="encode-status" class="status"></div>
+  <div id="encode-preview" class="preview-area hidden">
+    <canvas id="output-canvas"></canvas>
+    <div class="actions">
+      <button class="btn btn-secondary" onclick="downloadImage()">下载图片</button>
+    </div>
+  </div>
+  <div id="encode-error" class="error-msg hidden"></div>
+</div>
+
+<div id="decode-panel" class="panel">
+  <div class="drop-zone" id="drop-zone">
+    <input type="file" id="file-input" accept="image/*" onchange="handleFile(this.files[0])">
+    <div class="icon">🍩</div>
+    <p>拖放芝码图片到这里，或点击选择</p>
+  </div>
+  <div id="decode-preview" class="preview-area hidden">
+    <img id="decode-img">
+  </div>
+  <button class="btn" id="decode-btn" onclick="doDecode()" disabled>解码芝码</button>
+  <div id="decode-status" class="status"></div>
+  <div id="decode-result" class="result-box hidden"></div>
+  <div id="decode-error" class="error-msg hidden"></div>
+</div>
+
+<p class="info-text" style="text-align:center;margin-top:24px">
+  支持 B站 / 小红书链接 · 容量最大约 100 字节<br>
+  完全离线运行，数据不离开浏览器
+</p>
+</div>
+
+<script>
+// ============================================================
+// GF(256) Arithmetic — primitive polynomial 0x11D
+// ============================================================
+const GF_EXP = new Uint16Array(512);
+const GF_LOG = new Uint8Array(256);
+(function initGF() {
+  let x = 1;
+  for (let i = 0; i < 255; i++) {
+    GF_EXP[i] = x;
+    GF_LOG[x] = i;
+    x <<= 1;
+    if (x & 0x100) x ^= 0x11D;
+  }
+  for (let i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+})();
+
+function gf_mul(a, b) {
+  if (a === 0 || b === 0) return 0;
+  return GF_EXP[GF_LOG[a] + GF_LOG[b]];
+}
+function gf_div(a, b) {
+  if (b === 0) throw new Error("div by zero");
+  if (a === 0) return 0;
+  return GF_EXP[(GF_LOG[a] + 255 - GF_LOG[b]) % 255];
+}
+function gf_inv(a) { return GF_EXP[255 - GF_LOG[a]]; }
+function gf_pow(a, p) {
+  if (p === 0) return 1;
+  if (a === 0) return 0;
+  return GF_EXP[(GF_LOG[a] * p) % 255];
+}
+
+// Polynomial ops — big-endian: poly[0] = highest degree coefficient
+function poly_mul(p, q) {
+  const r = new Array(p.length + q.length - 1).fill(0);
+  for (let j = 0; j < q.length; j++)
+    for (let i = 0; i < p.length; i++)
+      r[i + j] ^= gf_mul(p[i], q[j]);
+  return r;
+}
+function poly_add(p, q) {
+  const r = new Array(Math.max(p.length, q.length)).fill(0);
+  for (let i = 0; i < p.length; i++) r[i + r.length - p.length] ^= p[i];
+  for (let i = 0; i < q.length; i++) r[i + r.length - q.length] ^= q[i];
+  return r;
+}
+function poly_eval(p, x) {
+  let y = p[0];
+  for (let i = 1; i < p.length; i++) y = gf_mul(y, x) ^ p[i];
+  return y;
+}
+function poly_scale(p, x) {
+  return p.map(c => gf_mul(c, x));
+}
+
+// ============================================================
+// Reed-Solomon Codec — matches reedsolo library
+// ============================================================
+class RSCodec {
+  constructor(nsym) {
+    this.nsym = nsym;
+    this.gen = this._generator();
+  }
+  _generator() {
+    let g = [1];
+    for (let i = 0; i < this.nsym; i++) g = poly_mul(g, [1, GF_EXP[i]]);
+    return g;
+  }
+  encode(data) {
+    const nsym = this.nsym, gen = this.gen;
+    const msg = new Array(data.length + nsym).fill(0);
+    for (let i = 0; i < data.length; i++) msg[i] = data[i];
+    for (let i = 0; i < data.length; i++) {
+      const coef = msg[i];
+      if (coef !== 0)
+        for (let j = 1; j < gen.length; j++)
+          msg[i + j] ^= gf_mul(gen[j], coef);
+    }
+    const out = new Uint8Array(data.length + nsym);
+    for (let i = 0; i < data.length; i++) out[i] = data[i];
+    for (let i = 0; i < nsym; i++) out[data.length + i] = msg[data.length + i];
+    return out;
+  }
+  calc_syndromes(msg) {
+    const syn = [];
+    for (let i = 0; i < this.nsym; i++) syn[i] = poly_eval(Array.from(msg), GF_EXP[i]);
+    return syn;
+  }
+  // Erasure locator: prod(1 + X_j * x) where X_j = alpha^(n-1-pos_j)
+  find_erasure_locator(erase_pos, msg_len) {
+    let loc = [1];
+    for (const pos of erase_pos) {
+      const Xj = GF_EXP[(msg_len - 1 - pos) % 255];
+      // Factor (1 + Xj*x) in big-endian: [Xj, 1]
+      loc = poly_mul(loc, [Xj, 1]);
+    }
+    return loc;
+  }
+  // Berlekamp-Massey with erasure support
+  find_error_locator(synd, nsym, erase_loc) {
+    let err_loc, old_loc;
+    if (erase_loc && erase_loc.length > 0) {
+      err_loc = Array.from(erase_loc);
+      old_loc = Array.from(erase_loc);
+    } else {
+      err_loc = [1];
+      old_loc = [1];
+    }
+    const synd_shift = erase_loc ? erase_loc.length - 1 : 0;
+    for (let i = synd_shift; i < nsym; i++) {
+      let delta = synd[i];
+      for (let j = 1; j < err_loc.length; j++)
+        delta ^= gf_mul(err_loc[err_loc.length - 1 - j], synd[i - j]);
+      old_loc.push(0);
+      if (delta !== 0) {
+        if (old_loc.length > err_loc.length) {
+          const new_loc = poly_scale(old_loc, delta);
+          old_loc = poly_scale(err_loc, gf_inv(delta));
+          err_loc = new_loc;
+        }
+        err_loc = poly_add(err_loc, poly_scale(old_loc, delta));
+      }
+    }
+    let start = 0;
+    while (start < err_loc.length - 1 && err_loc[start] === 0) start++;
+    return err_loc.slice(start);
+  }
+  // Chien search
+  find_errors(err_loc, msg_len) {
+    const degree = err_loc.length - 1;
+    const errs = [];
+    for (let i = 0; i < msg_len; i++) {
+      if (poly_eval(err_loc, GF_EXP[255 - i]) === 0)
+        errs.push(msg_len - 1 - i);
+    }
+    return errs.length === degree ? errs : null;
+  }
+  // Forney algorithm
+  correct_errata(msg, synd, err_pos) {
+    const n = msg.length;
+    msg = Array.from(msg);
+    // Build lambda(x) = prod(1 + X_j * x) in natural order (index=power)
+    let lambda = [1];
+    for (const pos of err_pos) {
+      const Xj = GF_EXP[(n - 1 - pos) % 255];
+      const newLam = new Array(lambda.length + 1).fill(0);
+      for (let i = 0; i < lambda.length; i++) {
+        newLam[i] ^= lambda[i];
+        newLam[i + 1] ^= gf_mul(lambda[i], Xj);
+      }
+      lambda = newLam;
+    }
+    // Omega = S(x) * lambda(x) mod x^nsym  (natural order)
+    const omega = new Array(this.nsym).fill(0);
+    for (let i = 0; i < synd.length; i++)
+      for (let j = 0; j < lambda.length && (i + j) < this.nsym; j++)
+        omega[i + j] ^= gf_mul(synd[i], lambda[j]);
+    // For each error position
+    for (const pos of err_pos) {
+      const Xj = GF_EXP[(n - 1 - pos) % 255];
+      const Xj_inv = gf_inv(Xj);
+      // Evaluate omega at Xj_inv
+      let omega_val = 0, xp = 1;
+      for (let i = 0; i < omega.length; i++) {
+        omega_val ^= gf_mul(omega[i], xp);
+        xp = gf_mul(xp, Xj_inv);
+      }
+      // Evaluate lambda' at Xj_inv: lambda'(x) = sum_{k odd} lambda[k] * x^{k-1}
+      let lp_val = 0, xp2 = 1;
+      for (let k = 1; k < lambda.length; k += 2) {
+        lp_val ^= gf_mul(lambda[k], xp2);
+        xp2 = gf_mul(xp2, gf_mul(Xj_inv, Xj_inv));
+      }
+      if (lp_val === 0) return null;
+      // Forney: Y = X * Omega(X^{-1}) / Lambda'(X^{-1})
+      msg[pos] ^= gf_div(gf_mul(Xj, omega_val), lp_val);
+    }
+    return msg;
+  }
+  decode(received, erase_pos) {
+    const msg = Array.from(received);
+    const msg_len = msg.length;
+    const nsym = this.nsym;
+    const synd = this.calc_syndromes(msg);
+    let all_zero = true;
+    for (const s of synd) if (s !== 0) { all_zero = false; break; }
+    if (all_zero) return new Uint8Array(msg.slice(0, msg_len - nsym));
+
+    const ne = erase_pos ? erase_pos.length : 0;
+    let erase_loc = null;
+    if (ne > 0) erase_loc = this.find_erasure_locator(erase_pos, msg_len);
+
+    const err_loc = this.find_error_locator(synd, nsym, erase_loc);
+    const degree = err_loc.length - 1;
+    const num_errors = degree - ne;
+    if (num_errors < 0 || 2 * num_errors + ne > nsym) return null;
+
+    const err_pos = this.find_errors(err_loc, msg_len);
+    if (err_pos === null) return null;
+
+    const all_pos = erase_pos ? [...erase_pos, ...err_pos] : [...err_pos];
+    const corrected = this.correct_errata(msg, synd, all_pos);
+    if (corrected === null) return null;
+
+    const syn2 = this.calc_syndromes(corrected);
+    for (const s of syn2) if (s !== 0) return null;
+
+    return new Uint8Array(corrected.slice(0, msg_len - nsym));
+  }
+}
+
+// ============================================================
+// Seeded PRNG — LCG matching between JS and Python
+// ============================================================
+function seededRandom(seed) {
+  let s = seed | 0;
+  return function() {
+    s = (s * 1103515245 + 12345) & 0x7fffffff;
+    return s / 0x7fffffff;
+  };
+}
+function fisherYatesShuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// ============================================================
+// Constants
+// ============================================================
+const DEFAULT_IMAGE_SIZE = 1024;
+const DEFAULT_EC = 30;
+const DEFAULT_SEED = 42;
+const VERSION_HEADER = [0x53, 0x53, 0x4D, 0x35]; // 'SSM5'
+const REPEAT = 5;
+const RING_OUTER_RATIO = 0.46;
+const RING_INNER_RATIO = 0.16;
+const SESAME_SPACING = 9.0;
+const METADATA_BYTES = 3;
+const VERSION_TABLE = {1: 30, 2: 70, 3: 142};
+
+function getRingParams(imageSize) {
+  const half = Math.floor(imageSize / 2);
+  return {
+    outer_r: Math.floor(half * RING_OUTER_RATIO * 2),
+    inner_r: Math.floor(half * RING_INNER_RATIO * 2)
+  };
+}
+
+// ============================================================
+// Polar Grid Builder
+// ============================================================
+function buildPolarGrid(cx, cy, inner_r, outer_r, spacing, fixedCount) {
+  const cells = [];
+  const n_rings = Math.max(1, Math.floor((outer_r - inner_r) / spacing));
+  const actual_r_step = (outer_r - inner_r) / n_rings;
+  for (let ri = 0; ri < n_rings; ri++) {
+    const r = inner_r + actual_r_step * (ri + 0.5);
+    const circ = 2 * Math.PI * r;
+    const n_angles = Math.max(1, Math.floor(circ / spacing));
+    const angle_step = 2 * Math.PI / n_angles;
+    const offset = (ri % 2) ? angle_step * 0.5 : 0;
+    for (let ai = 0; ai < n_angles; ai++) {
+      const angle = ai * angle_step + offset;
+      cells.push({ x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle), ri, ai });
+    }
+  }
+  if (fixedCount !== undefined) {
+    if (cells.length >= fixedCount) return cells.slice(0, fixedCount);
+    const rng = seededRandom(12345);
+    while (cells.length < fixedCount) {
+      const angle = rng() * 2 * Math.PI;
+      const rf = inner_r + (0.1 + rng() * 0.8) * (outer_r - inner_r);
+      cells.push({ x: cx + rf * Math.cos(angle), y: cy + rf * Math.sin(angle), ri: 0, ai: 0 });
+    }
+    return cells.slice(0, fixedCount);
+  }
+  return cells;
+}
+
+const _canonParams = getRingParams(DEFAULT_IMAGE_SIZE);
+const CANONICAL_GRID_COUNT = buildPolarGrid(
+  DEFAULT_IMAGE_SIZE / 2, DEFAULT_IMAGE_SIZE / 2,
+  _canonParams.inner_r + 4, _canonParams.outer_r - 4, SESAME_SPACING
+).length;
+
+// Total physical cells used by encoder = floor(gridCount/REPEAT)*REPEAT
+const N_TOTAL_LOGICAL = Math.floor(CANONICAL_GRID_COUNT / REPEAT);
+const N_PHYSICAL = N_TOTAL_LOGICAL * REPEAT;
+
+// ============================================================
+// Sector Interleaver
+// ============================================================
+class SectorInterleaver {
+  constructor(grid, nPhysical, repeat, seed) {
+    this.repeat = repeat;
+    this.nPhysical = nPhysical;
+    const cx = grid.reduce((s, c) => s + c.x, 0) / grid.length;
+    const cy = grid.reduce((s, c) => s + c.y, 0) / grid.length;
+    const angles = [];
+    for (let i = 0; i < Math.min(nPhysical, grid.length); i++)
+      angles.push(Math.atan2(grid[i].y - cy, grid[i].x - cx));
+    const sectors = Array.from({length: repeat}, () => []);
+    for (let i = 0; i < angles.length; i++) {
+      const s = Math.floor((angles[i] + Math.PI) / (2 * Math.PI) * repeat) % repeat;
+      sectors[s].push(i);
+    }
+    const rng = seededRandom(seed);
+    for (const s of sectors) fisherYatesShuffle(s, rng);
+    const logicalCount = Math.floor(nPhysical / repeat);
+    this.logicalToPhys = [];
+    const used = new Set();
+    for (let bitIdx = 0; bitIdx < logicalCount; bitIdx++) {
+      const assigned = [];
+      for (let rep = 0; rep < repeat; rep++) {
+        const sector = sectors[rep];
+        let found = false;
+        const start = bitIdx % sector.length;
+        for (let offset = 0; offset < sector.length; offset++) {
+          const candidate = sector[(start + offset) % sector.length];
+          if (!used.has(candidate)) { assigned.push(candidate); used.add(candidate); found = true; break; }
+        }
+        if (!found) {
+          for (let p = 0; p < nPhysical; p++)
+            if (!used.has(p)) { assigned.push(p); used.add(p); break; }
+        }
+      }
+      this.logicalToPhys.push(assigned);
+    }
+    this.logicalToPhysical = new Array(nPhysical).fill(0);
+    this.physicalToLogical = new Array(nPhysical).fill(0);
+    let lp = 0;
+    for (let bi = 0; bi < logicalCount; bi++)
+      for (let rep = 0; rep < repeat; rep++) {
+        const pp = this.logicalToPhys[bi][rep];
+        this.logicalToPhysical[lp] = pp;
+        this.physicalToLogical[pp] = lp;
+        lp++;
+      }
+  }
+  interleave(bits) {
+    const out = new Array(this.nPhysical).fill(0);
+    for (let i = 0; i < bits.length && i < this.nPhysical; i++)
+      out[this.logicalToPhysical[i]] = bits[i];
+    return out;
+  }
+  deinterleaveWithErasures(values) {
+    const out = new Array(this.nPhysical).fill(null);
+    for (let i = 0; i < Math.min(this.nPhysical, values.length); i++)
+      out[this.physicalToLogical[i]] = values[i];
+    return out;
+  }
+}
+
+// ============================================================
+// SHA-256 pure JS (synchronous)
+// ============================================================
+function sha256Sync(data) {
+  const K = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+  ];
+  const rotr = (n,x) => ((x>>>n)|(x<<(32-n)))>>>0;
+  const ch = (x,y,z) => ((x&y)^(~x&z))>>>0;
+  const maj = (x,y,z) => ((x&y)^(x&z)^(y&z))>>>0;
+  const s0 = x => (rotr(2,x)^rotr(13,x)^rotr(22,x))>>>0;
+  const s1 = x => (rotr(6,x)^rotr(11,x)^rotr(25,x))>>>0;
+  const g0 = x => (rotr(7,x)^rotr(18,x)^(x>>>3))>>>0;
+  const g1 = x => (rotr(17,x)^rotr(19,x)^(x>>>10))>>>0;
+  const bytes = Array.from(data);
+  const bitLen = bytes.length * 8;
+  bytes.push(0x80);
+  while (bytes.length % 64 !== 56) bytes.push(0);
+  for (let i = 7; i >= 0; i--) bytes.push(Math.floor(bitLen / Math.pow(2, i*8)) & 0xFF);
+  let H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  for (let off = 0; off < bytes.length; off += 64) {
+    const W = new Array(64);
+    for (let i = 0; i < 16; i++)
+      W[i] = (bytes[off+i*4]<<24|bytes[off+i*4+1]<<16|bytes[off+i*4+2]<<8|bytes[off+i*4+3])>>>0;
+    for (let i = 16; i < 64; i++)
+      W[i] = (g1(W[i-2])+W[i-7]+g0(W[i-15])+W[i-16])>>>0;
+    let [a,b,c,d,e,f,g,h] = H;
+    for (let i = 0; i < 64; i++) {
+      const T1 = (h+s1(e)+ch(e,f,g)+K[i]+W[i])>>>0;
+      const T2 = (s0(a)+maj(a,b,c))>>>0;
+      h=g;g=f;f=e;e=(d+T1)>>>0;d=c;c=b;b=a;a=(T1+T2)>>>0;
+    }
+    H = [(H[0]+a)>>>0,(H[1]+b)>>>0,(H[2]+c)>>>0,(H[3]+d)>>>0,(H[4]+e)>>>0,(H[5]+f)>>>0,(H[6]+g)>>>0,(H[7]+h)>>>0];
+  }
+  const r = new Uint8Array(32);
+  for (let i = 0; i < 8; i++) { r[i*4]=(H[i]>>24)&0xFF; r[i*4+1]=(H[i]>>16)&0xFF; r[i*4+2]=(H[i]>>8)&0xFF; r[i*4+3]=H[i]&0xFF; }
+  return r;
+}
+function sha256First4(data) { return sha256Sync(data).slice(0, 4); }
+
+// ============================================================
+// Bagel Renderer (Canvas)
+// ============================================================
+function drawBagel(ctx, size, cx, cy, outer_r, inner_r, seed) {
+  const imgData = ctx.createImageData(size, size);
+  const d = imgData.data;
+  // Use a separate PRNG for noise so it doesn't interfere with other uses
+  const rng = seededRandom(seed);
+  for (let py = 0; py < size; py++) {
+    for (let px = 0; px < size; px++) {
+      const idx = (py * size + px) * 4;
+      const dx = px - cx, dy = py - cy;
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist < outer_r && dist > inner_r) {
+        const t = (dist - inner_r) / (outer_r - inner_r);
+        const shade = Math.max(0, Math.min(1, 0.55 + 0.45 * Math.sin(t * Math.PI)));
+        const noise = (rng() - 0.5) * 16;
+        d[idx]   = Math.max(0, Math.min(255, Math.round(235*shade+20+noise)));
+        d[idx+1] = Math.max(0, Math.min(255, Math.round(155*shade+40+noise)));
+        d[idx+2] = Math.max(0, Math.min(255, Math.round(175*shade+45+noise)));
+        d[idx+3] = 255;
+      } else if (dist <= inner_r) {
+        d[idx]=245; d[idx+1]=230; d[idx+2]=235; d[idx+3]=255;
+      } else {
+        d[idx]=255; d[idx+1]=255; d[idx+2]=255; d[idx+3]=255;
+      }
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  ctx.strokeStyle = 'rgb(180,100,120)';
+  ctx.lineWidth = 2;
+  for (let off = 0; off < 2; off++) {
+    ctx.beginPath(); ctx.arc(cx, cy, outer_r-off, 0, 2*Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, inner_r+off, 0, 2*Math.PI); ctx.stroke();
+  }
+}
+
+function drawSesame(ctx, x, y, bit, rotation) {
+  const sz = 11;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rotation * Math.PI / 180);
+  const w = sz, h = Math.round(sz * 0.55);
+  // Base ellipse
+  ctx.beginPath();
+  ctx.ellipse(0, 0, w/2, h/2, 0, 0, 2*Math.PI);
+  if (bit === 0) {
+    ctx.fillStyle = `rgb(${Math.round(235*0.35)},${Math.round(220*0.30)},${Math.round(170*0.25)})`;
+  } else {
+    ctx.fillStyle = `rgb(${235+5},${220+5},${170+5})`;
+  }
+  ctx.fill();
+  // Highlight
+  ctx.beginPath();
+  ctx.ellipse(0, -h*0.15, w*0.25, h*0.2, 0, 0, 2*Math.PI);
+  if (bit === 0) {
+    ctx.fillStyle = `rgb(${Math.round(248*0.35)},${Math.round(238*0.30)},${Math.round(205*0.25)})`;
+  } else {
+    ctx.fillStyle = `rgb(${Math.min(255,253)},${Math.min(255,243)},${Math.min(255,210)})`;
+  }
+  ctx.fill();
+  // Outline
+  ctx.beginPath();
+  ctx.ellipse(0, 0, w/2, h/2, 0, 0, 2*Math.PI);
+  ctx.strokeStyle = 'rgba(185,165,110,0.5)';
+  ctx.lineWidth = 0.8;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ============================================================
+// Encoder
+// ============================================================
+function encodeToCanvas(text, canvas) {
+  const data = new TextEncoder().encode(text);
+  const sz = DEFAULT_IMAGE_SIZE;
+  const cx = sz/2, cy = sz/2;
+  const {outer_r, inner_r} = getRingParams(sz);
+  const rs = new RSCodec(DEFAULT_EC);
+  const grid = buildPolarGrid(cx, cy, inner_r+4, outer_r-4, SESAME_SPACING);
+
+  const totalBytes = Math.floor(Math.floor(grid.length / REPEAT) / 8);
+  const overhead = METADATA_BYTES + 4 + DEFAULT_EC;
+  const capacity = Math.max(0, totalBytes - overhead);
+  if (data.length > capacity) throw new Error(`数据过长: ${data.length} 字节, 最大 ${capacity}`);
+
+  let version = 0;
+  for (const v of [1,2,3]) if (data.length <= VERSION_TABLE[v]) { version = v; break; }
+  if (!version) throw new Error('数据过长');
+
+  // Metadata: version(1B) + length(2B)
+  const metaBytes = new Uint8Array([version, (data.length>>8)&0xFF, data.length&0xFF]);
+  const metaBits = [];
+  for (const b of metaBytes) for (let i = 7; i >= 0; i--) metaBits.push((b>>i)&1);
+
+  // Payload + hash
+  const payload = new Uint8Array(VERSION_HEADER.length + 2 + data.length);
+  payload.set(VERSION_HEADER, 0);
+  payload[VERSION_HEADER.length] = (data.length>>8)&0xFF;
+  payload[VERSION_HEADER.length+1] = data.length&0xFF;
+  payload.set(data, VERSION_HEADER.length+2);
+  const digest = sha256First4(payload);
+  const full = new Uint8Array(payload.length + 4);
+  full.set(payload, 0); full.set(digest, payload.length);
+
+  const encoded = rs.encode(full);
+  const dataBits = [];
+  for (const b of encoded) for (let i = 7; i >= 0; i--) dataBits.push((b>>i)&1);
+
+  // Combine meta + data + padding
+  const allLogical = [...metaBits, ...dataBits];
+  while (allLogical.length < N_TOTAL_LOGICAL) allLogical.push(0);
+
+  // Repeat
+  const physicalBits = [];
+  for (const b of allLogical) for (let r = 0; r < REPEAT; r++) physicalBits.push(b);
+
+  // Interleave with full grid size (matching decoder)
+  const interleaver = new SectorInterleaver(grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
+  const scattered = interleaver.interleave(physicalBits);
+
+  // Render
+  canvas.width = sz; canvas.height = sz;
+  const ctx = canvas.getContext('2d');
+  drawBagel(ctx, sz, cx, cy, outer_r, inner_r, DEFAULT_SEED);
+
+  const rng = seededRandom(DEFAULT_SEED + 1);
+  for (let i = 0; i < Math.min(N_PHYSICAL, grid.length); i++) {
+    drawSesame(ctx, grid[i].x, grid[i].y, scattered[i], -60 + rng() * 120);
+  }
+}
+
+// ============================================================
+// Decoder
+// ============================================================
+function decodeFromImage(imgElement) {
+  const w = imgElement.naturalWidth || imgElement.width;
+  const h = imgElement.naturalHeight || imgElement.height;
+  const tmpCanvas = document.createElement('canvas');
+  tmpCanvas.width = w; tmpCanvas.height = h;
+  const tmpCtx = tmpCanvas.getContext('2d');
+  tmpCtx.drawImage(imgElement, 0, 0);
+  const imgData = tmpCtx.getImageData(0, 0, w, h);
+  const px = imgData.data;
+
+  function getBri(x, y) {
+    x = Math.max(0, Math.min(w-1, x)); y = Math.max(0, Math.min(h-1, y));
+    const i = (y*w+x)*4;
+    return (px[i]+px[i+1]+px[i+2])/3;
+  }
+
+  const circle = detectBagelCircle(w, h, getBri);
+  if (!circle) throw new Error('无法检测贝果圆环');
+
+  // Normalize to canonical space
+  const ccx = DEFAULT_IMAGE_SIZE/2, ccy = DEFAULT_IMAGE_SIZE/2;
+  const cp = getRingParams(DEFAULT_IMAGE_SIZE);
+  const scale = cp.outer_r / Math.max(circle.detectedOuterR, 1);
+  const nc = document.createElement('canvas');
+  nc.width = DEFAULT_IMAGE_SIZE; nc.height = DEFAULT_IMAGE_SIZE;
+  const nctx = nc.getContext('2d');
+  nctx.fillStyle = '#FFF'; nctx.fillRect(0,0,DEFAULT_IMAGE_SIZE,DEFAULT_IMAGE_SIZE);
+  const nimg = nctx.getImageData(0,0,DEFAULT_IMAGE_SIZE,DEFAULT_IMAGE_SIZE);
+  const nd = nimg.data;
+  for (let py = 0; py < DEFAULT_IMAGE_SIZE; py++) {
+    for (let ppx = 0; ppx < DEFAULT_IMAGE_SIZE; ppx++) {
+      const sx = (ppx - ccx)/scale + circle.ccx;
+      const sy = (py - ccy)/scale + circle.ccy;
+      if (sx >= 0 && sx < w-1 && sy >= 0 && sy < h-1) {
+        const si = (Math.floor(sy)*w + Math.floor(sx))*4;
+        const di = (py*DEFAULT_IMAGE_SIZE+ppx)*4;
+        nd[di]=px[si]; nd[di+1]=px[si+1]; nd[di+2]=px[si+2]; nd[di+3]=255;
+      }
+    }
+  }
+  nctx.putImageData(nimg, 0, 0);
+  const cdata = nctx.getImageData(0,0,DEFAULT_IMAGE_SIZE,DEFAULT_IMAGE_SIZE).data;
+  function cBri(x,y) {
+    x = Math.max(0, Math.min(DEFAULT_IMAGE_SIZE-1, Math.round(x)));
+    y = Math.max(0, Math.min(DEFAULT_IMAGE_SIZE-1, Math.round(y)));
+    const i = (y*DEFAULT_IMAGE_SIZE+x)*4;
+    return (cdata[i]+cdata[i+1]+cdata[i+2])/3;
+  }
+
+  const grid = buildPolarGrid(ccx, ccy, cp.inner_r+4, cp.outer_r-4, SESAME_SPACING, CANONICAL_GRID_COUNT);
+  const rawValues = readTrinary(grid, cBri);
+
+  // Use the SAME interleaver size as encoder (full grid)
+  const rs = new RSCodec(DEFAULT_EC);
+  const fullInterleaver = new SectorInterleaver(grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
+  const allOrdered = fullInterleaver.deinterleaveWithErasures(rawValues.slice(0, N_PHYSICAL));
+
+  // Try metadata-guided decode
+  const result = tryDecodeWithOrdered(allOrdered, rs);
+  if (result) return result;
+
+  // Exhaustive fallback
+  return exhaustiveDecode(allOrdered, rs);
+}
+
+function tryDecodeWithOrdered(ordered, rs) {
+  const METADATA_PHYSICAL = METADATA_BYTES * 8 * REPEAT;
+  const metaLogicalCount = METADATA_BYTES * 8;
+  const metaBits = [];
+  for (let g = 0; g < metaLogicalCount; g++) {
+    const group = ordered.slice(g*REPEAT, (g+1)*REPEAT);
+    const ones = group.filter(v=>v===1).length;
+    const zeros = group.filter(v=>v===0).length;
+    metaBits.push(ones > zeros ? 1 : 0);
+  }
+  let v = 0, pl = 0;
+  for (let j = 0; j < 8; j++) v = (v<<1)|metaBits[j];
+  for (let j = 0; j < 16; j++) pl = (pl<<1)|metaBits[8+j];
+  if (!VERSION_TABLE[v] || pl > VERSION_TABLE[v]) return null;
+  return decodePayload(ordered, rs, pl);
+}
+
+function decodePayload(ordered, rs, payloadLen) {
+  const overheadBytes = VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
+  const dataLogicalBytes = overheadBytes + payloadLen;
+  const dataStartLogical = METADATA_BYTES * 8;
+  const dataEndLogical = dataStartLogical + dataLogicalBytes * 8;
+
+  if (dataEndLogical * REPEAT > N_PHYSICAL) return null;
+
+  const logicalBits = [], bitErased = [];
+  for (let g = dataStartLogical; g < dataEndLogical; g++) {
+    const group = ordered.slice(g*REPEAT, (g+1)*REPEAT);
+    const ones = group.filter(v=>v===1).length;
+    const zeros = group.filter(v=>v===0).length;
+    const nones = group.filter(v=>v===null||v===undefined).length;
+    logicalBits.push(ones > zeros ? 1 : 0);
+    bitErased.push(nones === REPEAT);
+  }
+
+  const tryBytes = Math.floor(logicalBits.length / 8);
+  const dataBytes = new Uint8Array(tryBytes);
+  const erasureBytePos = [];
+  for (let i = 0; i < tryBytes; i++) {
+    let val = 0, hasE = false;
+    for (let j = 0; j < 8; j++) {
+      val = (val<<1)|logicalBits[i*8+j];
+      if (bitErased[i*8+j]) hasE = true;
+    }
+    dataBytes[i] = val;
+    if (hasE) erasureBytePos.push(i);
+  }
+
+  const decoded = rs.decode(dataBytes, erasureBytePos.length > 0 ? erasureBytePos : null);
+  if (!decoded) return null;
+  const hl = VERSION_HEADER.length;
+  if (decoded.length < hl+6) return null;
+  for (let i = 0; i < hl; i++) if (decoded[i] !== VERSION_HEADER[i]) return null;
+
+  const dpl = (decoded[hl]<<8)|decoded[hl+1];
+  const ps = hl+2, pe = ps+dpl;
+  if (pe+4 > decoded.length) return null;
+
+  const payload = decoded.slice(ps, pe);
+  const storedHash = decoded.slice(pe, pe+4);
+  const check = new Uint8Array(hl+2+dpl);
+  check.set(VERSION_HEADER, 0);
+  check[hl] = (dpl>>8)&0xFF; check[hl+1] = dpl&0xFF;
+  check.set(payload, hl+2);
+  const expected = sha256First4(check);
+  for (let i = 0; i < 4; i++) if (storedHash[i] !== expected[i]) return null;
+
+  return new TextDecoder().decode(payload);
+}
+
+function exhaustiveDecode(ordered, rs) {
+  const overhead = VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
+  const maxPayload = Math.floor(N_TOTAL_LOGICAL/8) - METADATA_BYTES - overhead;
+  for (let guess = 5; guess <= Math.min(250, maxPayload); guess++) {
+    const r = decodePayload(ordered, rs, guess);
+    if (r) return r;
+  }
+  return null;
+}
+
+// Circle detection
+function detectBagelCircle(w, h, getBri) {
+  let minX=w,maxX=0,minY=h,maxY=0,found=false;
+  const step = Math.max(1, Math.floor(Math.min(w,h)/200));
+  for (let y=0;y<h;y+=step) for (let x=0;x<w;x+=step)
+    if (getBri(x,y)<230) { minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y);found=true; }
+  if (!found) return null;
+
+  const candidates = [{cx:(minX+maxX)/2,cy:(minY+maxY)/2},{cx:w/2,cy:h/2}];
+  let best=null, bestCount=-1;
+
+  for (const {cx:icx,cy:icy} of candidates) {
+    let ccx=icx,ccy=icy,outerR=null,innerR=null;
+    for (let iter=0;iter<5;iter++) {
+      const nA=180,outerPts=[],innerPts=[];
+      for (let ai=0;ai<nA;ai++) {
+        const ang=2*Math.PI*ai/nA,dx=Math.cos(ang),dy=Math.sin(ang);
+        let prev=null;
+        for (let r=5;r<Math.min(w,h)/2;r++) {
+          const px=Math.round(ccx+r*dx),py=Math.round(ccy+r*dy);
+          if (px<0||px>=w||py<0||py>=h) break;
+          const b=getBri(px,py);
+          if (prev!==null&&prev<220&&b>240) { outerPts.push({x:ccx+r*dx,y:ccy+r*dy});break; }
+          prev=b;
+        }
+        const cb=getBri(Math.round(ccx),Math.round(ccy));
+        for (let r=1;r<300;r++) {
+          const px=Math.round(ccx+r*dx),py=Math.round(ccy+r*dy);
+          if (px<0||px>=w||py<0||py>=h) break;
+          if (getBri(px,py)<cb-25) { innerPts.push({x:ccx+r*dx,y:ccy+r*dy});break; }
+        }
+      }
+      if (outerPts.length<6) break;
+      const f=fitCircleRobust(outerPts);
+      ccx=f.cx;ccy=f.cy;outerR=f.r;
+      if (innerPts.length>=6) { const fi=fitCircleRobust(innerPts);innerR=fi.r; }
+      else innerR=Math.max(1,outerR*RING_INNER_RATIO/RING_OUTER_RATIO);
+    }
+    if (outerR && outerPts_count(ccx,ccy,outerR,w,h,getBri) > bestCount) {
+      bestCount = outerPts_count(ccx,ccy,outerR,w,h,getBri);
+      best = {ccx,ccy,detectedOuterR:outerR,detectedInnerR:outerR*RING_INNER_RATIO/RING_OUTER_RATIO};
+    }
+  }
+  return best;
+}
+
+function outerPts_count(cx,cy,r,w,h,getBri) {
+  let count=0;
+  for (let ai=0;ai<90;ai++) {
+    const ang=2*Math.PI*ai/90,dx=Math.cos(ang),dy=Math.sin(ang);
+    let prev=null;
+    for (let ri=5;ri<Math.min(w,h)/2;ri++) {
+      const px=Math.round(cx+ri*dx),py=Math.round(cy+ri*dy);
+      if (px<0||px>=w||py<0||py>=h) break;
+      const b=getBri(px,py);
+      if (prev!==null&&prev<220&&b>240) { count++;break; }
+      prev=b;
+    }
+  }
+  return count;
+}
+
+function fitCircle(points) {
+  const n=points.length;
+  let sx=0,sy=0;
+  for (const p of points){sx+=p.x;sy+=p.y;}
+  const mx=sx/n,my=sy/n;
+  let Suu=0,Suv=0,Svv=0,Suuu=0,Suvv=0,Svuu=0,Svvv=0;
+  for (const p of points) {
+    const u=p.x-mx,v=p.y-my;
+    Suu+=u*u;Suv+=u*v;Svv+=v*v;Suuu+=u*u*u;Suvv+=u*v*v;Svuu+=v*u*u;Svvv+=v*v*v;
+  }
+  const det=Suu*Svv-Suv*Suv;
+  if (Math.abs(det)<1e-10) return {cx:mx,cy:my,r:Math.sqrt(Suu+Svv)};
+  const b1=0.5*(Suuu+Suvv),b2=0.5*(Svuu+Svvv);
+  const uc=(Svv*b1-Suv*b2)/det,vc=(Suu*b2-Suv*b1)/det;
+  return {cx:mx+uc,cy:my+vc,r:Math.sqrt(uc*uc+vc*vc+(Suu+Svv)/n)};
+}
+
+function fitCircleRobust(points, maxIter=5) {
+  let pts=[...points];
+  for (let i=0;i<maxIter;i++) {
+    if (pts.length<6) break;
+    const {cx,cy,r}=fitCircle(pts);
+    const ds=pts.map(p=>Math.abs(Math.sqrt((p.x-cx)**2+(p.y-cy)**2)-r));
+    const sorted=[...ds].sort((a,b)=>a-b);
+    const med=sorted[Math.floor(sorted.length/2)];
+    const thr=Math.max(med*3,15);
+    pts=pts.filter((_,j)=>ds[j]<thr);
+  }
+  return pts.length>=6 ? fitCircle(pts) : fitCircle(points);
+}
+
+function readTrinary(grid, getBri) {
+  const values = [];
+  for (const {x,y} of grid) {
+    const ix=Math.round(x),iy=Math.round(y);
+    let sum=0,cnt=0;
+    for (let dy=-2;dy<=2;dy++) for (let dx=-2;dx<=2;dx++) {
+      const px=ix+dx,py=iy+dy;
+      if (px>=0&&py>=0&&px<DEFAULT_IMAGE_SIZE&&py<DEFAULT_IMAGE_SIZE) { sum+=getBri(px,py);cnt++; }
+    }
+    const b = cnt>0 ? sum/cnt : 128;
+    if (b<110) values.push(0);
+    else if (b>190) values.push(1);
+    else values.push(null);
+  }
+  return values;
+}
+
+// ============================================================
+// UI
+// ============================================================
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach((t,i) => {
+    t.classList.toggle('active', (i===0&&tab==='encode')||(i===1&&tab==='decode'));
+  });
+  document.getElementById('encode-panel').classList.toggle('active', tab==='encode');
+  document.getElementById('decode-panel').classList.toggle('active', tab==='decode');
+}
+
+function checkPlatform() {
+  const url = document.getElementById('url-input').value;
+  const tag = document.getElementById('platform-tag');
+  if (/bilibili\.com|b23\.tv/i.test(url))
+    tag.innerHTML = '<span class="platform-indicator platform-bilibili">B站</span>';
+  else if (/xiaohongshu\.com|xhslink/i.test(url))
+    tag.innerHTML = '<span class="platform-indicator platform-xiaohongshu">小红书</span>';
+  else if (url.length > 0)
+    tag.innerHTML = '<span class="platform-indicator platform-other">其他链接</span>';
+  else tag.innerHTML = '';
+}
+
+function doEncode() {
+  const url = document.getElementById('url-input').value.trim();
+  if (!url) { showError('encode-error','请输入链接'); return; }
+  const btn=document.getElementById('encode-btn'),status=document.getElementById('encode-status'),
+        preview=document.getElementById('encode-preview'),errDiv=document.getElementById('encode-error');
+  btn.disabled=true; status.textContent='正在生成芝码...';
+  errDiv.classList.add('hidden'); preview.classList.add('hidden');
+  try {
+    encodeToCanvas(url, document.getElementById('output-canvas'));
+    preview.classList.remove('hidden'); status.textContent='生成完成!';
+  } catch(e) { showError('encode-error',e.message); status.textContent=''; }
+  btn.disabled=false;
+}
+
+function downloadImage() {
+  const c = document.getElementById('output-canvas');
+  const a = document.createElement('a');
+  a.download='sesame_code.png'; a.href=c.toDataURL('image/png'); a.click();
+}
+
+let uploadedImage = null;
+function handleFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => {
+      uploadedImage = img;
+      document.getElementById('decode-img').src = e.target.result;
+      document.getElementById('decode-preview').classList.remove('hidden');
+      document.getElementById('decode-btn').disabled = false;
+      document.getElementById('decode-error').classList.add('hidden');
+      document.getElementById('decode-result').classList.add('hidden');
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+const dropZone = document.getElementById('drop-zone');
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault(); dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
+});
+
+function doDecode() {
+  if (!uploadedImage) return;
+  const btn=document.getElementById('decode-btn'),status=document.getElementById('decode-status'),
+        resultDiv=document.getElementById('decode-result'),errDiv=document.getElementById('decode-error');
+  btn.disabled=true; status.textContent='正在解码...';
+  errDiv.classList.add('hidden'); resultDiv.classList.add('hidden');
+  try {
+    const result = decodeFromImage(uploadedImage);
+    if (result) {
+      resultDiv.innerHTML = `<p>解码结果:</p><a href="${escapeHtml(result)}" target="_blank" rel="noopener">${escapeHtml(result)}</a><div class="actions"><a class="btn btn-secondary" href="${escapeHtml(result)}" target="_blank" rel="noopener">跳转链接</a></div>`;
+      resultDiv.classList.remove('hidden'); status.textContent='解码成功!';
+    } else { showError('decode-error','解码失败，无法识别芝码'); status.textContent=''; }
+  } catch(e) { showError('decode-error',e.message); status.textContent=''; }
+  btn.disabled=false;
+}
+
+function showError(id, msg) {
+  const el=document.getElementById(id); el.textContent=msg; el.classList.remove('hidden');
+}
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>
