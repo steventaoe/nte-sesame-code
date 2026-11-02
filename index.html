@@ -41,6 +41,7 @@ input:focus{border-color:var(--pink)}
 .error-msg{color:#D44;margin-top:10px;font-size:0.9em}
 .info-text{font-size:0.8em;color:#A08090;margin-top:12px}
 .actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.raw-payload{margin:6px 0 0;padding:10px;background:#FFF6F8;border:1px solid #F0D8E0;border-radius:8px;font-size:0.85em;white-space:pre-wrap;word-break:break-all}
 .hidden{display:none}
 .status{font-size:0.85em;color:#A07080;margin-top:10px;min-height:1.2em}
 canvas{image-rendering:auto}
@@ -123,7 +124,7 @@ canvas{image-rendering:auto}
 </p>
 </div>
 
-<script>
+<script id="codec-src">
 // ============================================================
 // GF(256) Arithmetic — primitive polynomial 0x11D
 // ============================================================
@@ -681,18 +682,1229 @@ function encodeToCanvas(text, canvas) {
 }
 
 // ============================================================
+// Camera-robust front end
+//
+// A phone frame differs from a rendered PNG in four ways: the bagel is small
+// and off-center, the view is tilted (circle -> ellipse plus keystone), the
+// in-plane rotation is unknown, and illumination is arbitrary. So this path
+// works on a morphological white top-hat response instead of fixed brightness
+// thresholds, and fits the whole pose: center, scale, aspect, tilt axis,
+// rotation, keystone. Geometry comes from the rim conic of the seed disc;
+// rotation comes from REPEAT-copy agreement, because no score computed from
+// the samples alone can tell a rotation from an alias of it.
+// ============================================================
+const ANALYZE_MAX_DIM = 560;
+const R0 = 467.0;
+// Canonical radii the observed conics are matched against, in 1024px render
+// units: the seed rim and the hole edge.
+const CANON_RIM_R = 468.0;
+const CANON_HOLE_R = 165.0;
+
+function pymod(a, m) { const r = a % m; return r < 0 ? r + m : r; }
+
+// numpy semantics: arange length is ceil((stop-start)/step), values are
+// start + i*step. Written out rather than hardcoded so the step sizes below
+// stay readable and stay in sync with the Python decoder.
+function arangeF(start, stop, step) {
+  const n = Math.max(0, Math.ceil((stop - start) / step));
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) out[i] = start + i * step;
+  return out;
+}
+function linspaceF(a, b, n) {
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) out[i] = n === 1 ? a : a + (b - a) * i / (n - 1);
+  return out;
+}
+function medianF(a) {
+  const s = Float64Array.from(a).sort();
+  const n = s.length;
+  if (!n) return NaN;
+  return (n & 1) ? s[(n - 1) >> 1] : 0.5 * (s[(n >> 1) - 1] + s[n >> 1]);
+}
+function percentileSortedF(sorted, p) {
+  const n = sorted.length;
+  if (!n) return NaN;
+  const pos = (n - 1) * p / 100;
+  const lo = Math.floor(pos), hi = Math.ceil(pos);
+  return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+// Area-average downscale matching PIL's BOX resample: the window for output
+// pixel j is centered at (j+0.5)*scale-0.5 with half-width 0.5*scale, and the
+// filter is evaluated at source pixel *centers*, so every source pixel inside
+// the window gets weight exactly 1 and the result is their mean. Clamped at
+// the frame edge and renormalized by the count actually used.
+function boxResizeF(src, sw, sh, dw, dh) {
+  const rx = sw / dw, ry = sh / dh;
+  const tmp = new Float64Array(dw * sh);
+  for (let j = 0; j < dw; j++) {
+    const c = (j + 0.5) * rx - 0.5, half = 0.5 * rx;
+    let k0 = Math.max(0, Math.ceil(c - half));
+    let k1 = Math.min(sw - 1, Math.floor(c + half));
+    if (k1 < k0) continue;
+    const inv = 1 / (k1 - k0 + 1);
+    for (let y = 0; y < sh; y++) {
+      const so = y * sw;
+      let acc = 0;
+      for (let k = k0; k <= k1; k++) acc += src[so + k];
+      tmp[y * dw + j] = acc * inv;
+    }
+  }
+  const out = new Float64Array(dw * dh);
+  for (let i = 0; i < dh; i++) {
+    const c = (i + 0.5) * ry - 0.5, half = 0.5 * ry;
+    const k0 = Math.max(0, Math.ceil(c - half));
+    const k1 = Math.min(sh - 1, Math.floor(c + half));
+    if (k1 < k0) continue;
+    const inv = 1 / (k1 - k0 + 1);
+    for (let j = 0; j < dw; j++) {
+      let acc = 0;
+      for (let k = k0; k <= k1; k++) acc += tmp[k * dw + j];
+      out[i * dw + j] = acc * inv;
+    }
+  }
+  return out;
+}
+
+// Separable mean over a clamped window. Separable is exact here, not an
+// approximation: the 2D window mean factors into a row mean then a column mean.
+function boxBlurF(a, w, h, rad) {
+  const n = w * h;
+  if (rad <= 0) return Float64Array.from(a);
+  const tmp = new Float64Array(n);
+  const pre = new Float64Array(w + 1);
+  for (let y = 0; y < h; y++) {
+    const o = y * w;
+    pre[0] = 0;
+    for (let x = 0; x < w; x++) pre[x + 1] = pre[x] + a[o + x];
+    for (let x = 0; x < w; x++) {
+      const x0 = x - rad < 0 ? 0 : x - rad;
+      const x1 = x + rad > w - 1 ? w - 1 : x + rad;
+      tmp[o + x] = (pre[x1 + 1] - pre[x0]) / (x1 - x0 + 1);
+    }
+  }
+  const out = new Float64Array(n);
+  const prec = new Float64Array(h + 1);
+  for (let x = 0; x < w; x++) {
+    prec[0] = 0;
+    for (let y = 0; y < h; y++) prec[y + 1] = prec[y] + tmp[y * w + x];
+    for (let y = 0; y < h; y++) {
+      const y0 = y - rad < 0 ? 0 : y - rad;
+      const y1 = y + rad > h - 1 ? h - 1 : y + rad;
+      out[y * w + x] = (prec[y1 + 1] - prec[y0]) / (y1 - y0 + 1);
+    }
+  }
+  return out;
+}
+
+// Separable min/max with edge clamping.
+//
+// Two things matter here. The comparison is a plain `<`/`>` rather than
+// Math.min/Math.max -- the intrinsic has to handle NaN and signed zero and
+// lowers to a branchy sequence that measured 10x slower on this data. And the
+// vertical pass runs in narrow column blocks: unblocked, its k rows times the
+// full frame width overflows L1 and every window re-read comes from L2.
+function movExtremeF(a, w, h, k, wantMin) {
+  const n = w * h;
+  if (k <= 1) return Float64Array.from(a);
+  k = k | 1;
+  const pad = k >> 1;
+  const tmp = new Float64Array(n);
+  const out = new Float64Array(n);
+  const hLast = h - 1, wLast = w - 1;
+  const BLOCK = 64;
+  if (wantMin) {
+    for (let bx = 0; bx < w; bx += BLOCK) {
+      const bx1 = bx + BLOCK < w ? bx + BLOCK : w;
+      for (let y = 0; y < h; y++) {
+        const y0 = y - pad < 0 ? 0 : y - pad;
+        const y1 = y + pad > hLast ? hLast : y + pad;
+        const r0 = y0 * w;
+        for (let x = bx; x < bx1; x++) {
+          let v = a[r0 + x];
+          for (let yy = y0 + 1; yy <= y1; yy++) {
+            const t = a[yy * w + x];
+            if (t < v) v = t;
+          }
+          tmp[y * w + x] = v;
+        }
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      const o = y * w;
+      for (let x = 0; x < w; x++) {
+        const x0 = x - pad < 0 ? 0 : x - pad;
+        const x1 = x + pad > wLast ? wLast : x + pad;
+        let v = tmp[o + x0];
+        for (let xx = x0 + 1; xx <= x1; xx++) {
+          const t = tmp[o + xx];
+          if (t < v) v = t;
+        }
+        out[o + x] = v;
+      }
+    }
+  } else {
+    for (let bx = 0; bx < w; bx += BLOCK) {
+      const bx1 = bx + BLOCK < w ? bx + BLOCK : w;
+      for (let y = 0; y < h; y++) {
+        const y0 = y - pad < 0 ? 0 : y - pad;
+        const y1 = y + pad > hLast ? hLast : y + pad;
+        const r0 = y0 * w;
+        for (let x = bx; x < bx1; x++) {
+          let v = a[r0 + x];
+          for (let yy = y0 + 1; yy <= y1; yy++) {
+            const t = a[yy * w + x];
+            if (t > v) v = t;
+          }
+          tmp[y * w + x] = v;
+        }
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      const o = y * w;
+      for (let x = 0; x < w; x++) {
+        const x0 = x - pad < 0 ? 0 : x - pad;
+        const x1 = x + pad > wLast ? wLast : x + pad;
+        let v = tmp[o + x0];
+        for (let xx = x0 + 1; xx <= x1; xx++) {
+          const t = tmp[o + xx];
+          if (t > v) v = t;
+        }
+        out[o + x] = v;
+      }
+    }
+  }
+  return out;
+}
+
+// White top-hat: image minus its morphological opening. Keeps bright blobs
+// smaller than k and cancels broad shading and background texture, which a
+// plain high-pass would leave competing with the seeds.
+function tophatF(a, w, h, k) {
+  const n = w * h;
+  const out = new Float64Array(n);
+  if (k <= 1) {
+    const b = boxBlurF(a, w, h, 8);
+    for (let i = 0; i < n; i++) out[i] = a[i] - b[i];
+    return out;
+  }
+  const opened = movExtremeF(movExtremeF(a, w, h, k, true), w, h, k, false);
+  for (let i = 0; i < n; i++) out[i] = a[i] - opened[i];
+  return out;
+}
+
+// Flood-fill of pure-white regions connected to the frame border: a torn or
+// white-background edge must read as an erasure, never as a seed.
+function borderWhiteF(gray, w, h, thresh) {
+  const mask = new Uint8Array(w * h);
+  const stack = [];
+  const push = i => { if (gray[i] >= thresh && !mask[i]) { mask[i] = 1; stack.push(i); } };
+  for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+  while (stack.length) {
+    const i = stack.pop(), x = i % w;
+    if (x > 0) push(i - 1);
+    if (x < w - 1) push(i + 1);
+    if (i >= w) push(i - w);
+    if (i < (h - 1) * w) push(i + w);
+  }
+  return mask;
+}
+
+function solveLin5(A, b) {
+  const n = 5, stride = n + 1;
+  const M = new Float64Array(n * stride);
+  let mag = 0;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      M[i * stride + j] = A[i * n + j];
+      const av = Math.abs(A[i * n + j]);
+      if (av > mag) mag = av;
+    }
+    M[i * stride + n] = b[i];
+  }
+  // Relative, not absolute: the caller's coefficients can legitimately span
+  // many orders of magnitude (x^4 against x), and only rank deficiency -- not
+  // smallness -- makes the system unsolvable.
+  const pvFloor = mag > 0 ? 1e-14 * mag : 0;
+  for (let c = 0; c < n; c++) {
+    let piv = c, pv = Math.abs(M[c * stride + c]);
+    for (let r = c + 1; r < n; r++) {
+      const v = Math.abs(M[r * stride + c]);
+      if (v > pv) { pv = v; piv = r; }
+    }
+    if (pv <= pvFloor) return null;
+    if (piv !== c) {
+      for (let j = 0; j <= n; j++) {
+        const t = M[c * stride + j];
+        M[c * stride + j] = M[piv * stride + j];
+        M[piv * stride + j] = t;
+      }
+    }
+    const d = M[c * stride + c];
+    for (let r = c + 1; r < n; r++) {
+      const f = M[r * stride + c] / d;
+      if (f === 0) continue;
+      for (let j = c; j <= n; j++) M[r * stride + j] -= f * M[c * stride + j];
+    }
+  }
+  const x = new Float64Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = M[i * stride + n];
+    for (let j = i + 1; j < n; j++) s -= M[i * stride + j] * x[j];
+    x[i] = s / M[i * stride + i];
+  }
+  return x;
+}
+
+// Eigenpair of a symmetric 2x2, ascending by eigenvalue, matching eigh's
+// ordering. Vector sign is arbitrary -- every consumer of psi is invariant
+// under a pi shift, so it does not have to agree with LAPACK's.
+function symEigen2(p, q, r) {
+  const tr = p + r, det = p * r - q * q;
+  const sq = Math.sqrt(Math.max(tr * tr / 4 - det, 0));
+  const lam0 = tr / 2 - sq, lam1 = tr / 2 + sq;
+  let vx, vy;
+  if (Math.abs(q) > 1e-14 * Math.max(1, Math.abs(tr))) { vx = lam0 - r; vy = q; }
+  else if (p <= r) { vx = 1; vy = 0; }
+  else { vx = 0; vy = 1; }
+  return {lam0, lam1, v0x: vx, v0y: vy};
+}
+
+// Algebraic ellipse fit with 2.5-sigma clipping -> {cx, cy, a, asp, psi}.
+function conicFit(pxIn, pyIn) {
+  let xs = Float64Array.from(pxIn), ys = Float64Array.from(pyIn);
+  if (xs.length < 24) return null;
+  let cx = 0, cy = 0, aMaj = 0, asp = 0, psi = 0;
+  for (let iter = 0; iter < 3; iter++) {
+    const n = xs.length;
+    if (n < 24) return null;
+    // No centering, no scaling, however tempting: the design matrix is
+    // [x^2, xy, y^2, x, y] against a constant term pinned at 1, and any affine
+    // change of variables folds into that constant. Rescaling would silently
+    // reweight the least-squares problem and flip the sign of `val`, which the
+    // ellipse test below depends on.
+    const A = new Float64Array(25), rhs = new Float64Array(5);
+    for (let i = 0; i < n; i++) {
+      const u = xs[i], v = ys[i];
+      const f0 = u * u, f1 = u * v, f2 = v * v;
+      const f = [f0, f1, f2, u, v];
+      for (let a = 0; a < 5; a++) {
+        rhs[a] -= f[a];
+        const fa = f[a], row = a * 5;
+        for (let b = 0; b < 5; b++) A[row + b] += fa * f[b];
+      }
+    }
+    const sol = solveLin5(A, rhs);
+    if (!sol) return null;
+    const Ac = sol[0], Bc = sol[1], Cc = sol[2], Dc = sol[3], Fc = sol[4];
+    const p = Ac, q = Bc / 2, r = Cc;
+    const detM = 4 * p * r - Bc * Bc;
+    if (Math.abs(detM) < 1e-12 * (4 * Math.abs(p * r) + Bc * Bc)) return null;
+    const cu = (-2 * r * Dc + Bc * Fc) / detM;
+    const cv = (-2 * p * Fc + Bc * Dc) / detM;
+    const val = (p * cu * cu + Bc * cu * cv + r * cv * cv) + Dc * cu + Fc * cv + 1;
+    if (val >= -1e-9) return null;
+    const inv = 1 / (-val);
+    const eig = symEigen2(p * inv, q * inv, r * inv);
+    if (eig.lam0 <= 1e-12 || eig.lam1 <= 1e-12) return null;
+    const ax0 = 1 / Math.sqrt(eig.lam0), ax1 = 1 / Math.sqrt(eig.lam1);
+    cx = cu; cy = cv;
+    psi = Math.atan2(eig.v0y, eig.v0x);
+    aMaj = ax0;
+    asp = ax1 / ax0;
+
+    const bMin = Math.max(aMaj * asp, 1e-9);
+    const resid = new Float64Array(n);
+    let rsum = 0;
+    for (let i = 0; i < n; i++) {
+      const dx = xs[i] - cx, dy = ys[i] - cy;
+      const tt = Math.atan2(dy, dx) - psi;
+      const ct = Math.cos(tt), st = Math.sin(tt);
+      const rmod = 1 / Math.sqrt(ct * ct / (aMaj * aMaj) + st * st / (bMin * bMin));
+      resid[i] = Math.abs(Math.sqrt(dx * dx + dy * dy) - rmod);
+      rsum += resid[i];
+    }
+    const rmean = rsum / n;
+    let rv = 0;
+    for (let i = 0; i < n; i++) { const d = resid[i] - rmean; rv += d * d; }
+    const lim = Math.max(2.5 * Math.sqrt(rv / n), 1.5);
+    const kx2 = [], ky2 = [];
+    for (let i = 0; i < n; i++) if (resid[i] < lim) { kx2.push(xs[i]); ky2.push(ys[i]); }
+    if (kx2.length < 24) break;
+    xs = Float64Array.from(kx2); ys = Float64Array.from(ky2);
+  }
+  if (xs.length < 24) return null;
+  return {cx, cy, a: aMaj, asp: Math.min(Math.max(asp, 0.3), 1.0), psi};
+}
+
+// 8-DOF pose: rotate by phi, radial keystone, anisotropic squeeze about theta,
+// scale, translate. This is a complete homography parameterization, so any
+// tilted plane can be represented exactly.
+function projectPoint(prm, px, py) {
+  const cp = Math.cos(prm.phi), sp = Math.sin(prm.phi);
+  let ux = px * cp - py * sp;
+  let uy = px * sp + py * cp;
+  let d = 1 + (prm.kx * ux + prm.ky * uy) / R0;
+  d = d < 0.35 ? 0.35 : (d > 2.5 ? 2.5 : d);
+  ux /= d; uy /= d;
+  const ct = Math.cos(prm.theta), st = Math.sin(prm.theta);
+  const u = ux * ct - uy * st;
+  const v = (ux * st + uy * ct) * prm.aspect;
+  return [prm.cx + (u * ct + v * st) * prm.scale,
+          prm.cy + (-u * st + v * ct) * prm.scale];
+}
+
+function clonePose(p) {
+  return {cx: p.cx, cy: p.cy, scale: p.scale, aspect: p.aspect,
+          theta: p.theta, phi: p.phi, kx: p.kx, ky: p.ky};
+}
+
+// Lazily built: the interleaver costs a few milliseconds and the encode path
+// never needs any of it.
+const CAM = {
+  ready: false, _grid: null, _inter: null, _whit: null,
+  qx: null, qy: null, xs: null, ys: null, vals: null, bits: null, copies: null,
+  init() {
+    if (this.ready) return;
+    this._grid = buildPolarGrid(DEFAULT_IMAGE_SIZE / 2, DEFAULT_IMAGE_SIZE / 2,
+                                getRingParams(DEFAULT_IMAGE_SIZE).inner_r + 4,
+                                getRingParams(DEFAULT_IMAGE_SIZE).outer_r - 4,
+                                SESAME_SPACING, CANONICAL_GRID_COUNT);
+    const half = DEFAULT_IMAGE_SIZE / 2;
+    this.qx = new Float64Array(N_PHYSICAL);
+    this.qy = new Float64Array(N_PHYSICAL);
+    for (let i = 0; i < N_PHYSICAL; i++) {
+      this.qx[i] = this._grid[i].x - half;
+      this.qy[i] = this._grid[i].y - half;
+    }
+    this.xs = new Float64Array(N_PHYSICAL);
+    this.ys = new Float64Array(N_PHYSICAL);
+    this.vals = new Float64Array(N_PHYSICAL);
+    this.bits = new Int8Array(N_PHYSICAL);
+    this._inter = new SectorInterleaver(this._grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
+    this._whit = whiteningSequence(N_TOTAL_LOGICAL);
+    this.copies = new Int32Array(N_TOTAL_LOGICAL * REPEAT);
+    for (let g = 0; g < N_TOTAL_LOGICAL; g++)
+      for (let r = 0; r < REPEAT; r++)
+        this.copies[g * REPEAT + r] = this._inter.logicalToPhys[g][r];
+    this.ready = true;
+  },
+  grid() { this.init(); return this._grid; }
+};
+
+function projectAll(prm) {
+  const {qx, qy, xs, ys} = CAM;
+  const cp = Math.cos(prm.phi), sp = Math.sin(prm.phi);
+  const ct = Math.cos(prm.theta), st = Math.sin(prm.theta);
+  const kx = prm.kx / R0, ky = prm.ky / R0;
+  const asp = prm.aspect, sc = prm.scale, ox = prm.cx, oy = prm.cy;
+  for (let i = 0; i < N_PHYSICAL; i++) {
+    const px = qx[i], py = qy[i];
+    let ux = px * cp - py * sp;
+    let uy = px * sp + py * cp;
+    let d = 1 + kx * ux + ky * uy;
+    d = d < 0.35 ? 0.35 : (d > 2.5 ? 2.5 : d);
+    ux /= d; uy /= d;
+    const u = ux * ct - uy * st;
+    const v = (ux * st + uy * ct) * asp;
+    xs[i] = ox + (u * ct + v * st) * sc;
+    ys[i] = oy + (-u * st + v * ct) * sc;
+  }
+}
+
+// Bilinear sample of every cell; NaN marks a cell that fell outside the frame.
+//
+// The range test is on the float coordinate rather than the floored index, so
+// the truncating `|0` is safe (non-negative) and the inner loop never calls
+// Math.floor -- which V8 declines to inline here and which cost 30x more than
+// the sampling itself.
+function sampleCells(img, w, h, vals) {
+  const {xs, ys} = CAM;
+  const wLim = w - 1, hLim = h - 1;
+  for (let i = 0; i < N_PHYSICAL; i++) {
+    const X = xs[i], Y = ys[i];
+    if (X < 0 || X >= wLim || Y < 0 || Y >= hLim) { vals[i] = NaN; continue; }
+    const x0 = X | 0, y0 = Y | 0;
+    const fx = X - x0, fy = Y - y0, o = y0 * w + x0;
+    const a = img[o], b = img[o + 1], c = img[o + w], d = img[o + w + 1];
+    vals[i] = a * (1 - fx) * (1 - fy) + b * fx * (1 - fy)
+            + c * (1 - fx) * fy + d * fx * fy;
+  }
+}
+
+// Otsu threshold plus the normalized between-class separability.
+function otsuF(vals) {
+  const n = vals.length;
+  let count = 0, lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const v = vals[i];
+    if (v === v) { count++; if (v < lo) lo = v; if (v > hi) hi = v; }
+  }
+  if (count < 64) return null;
+  if (hi - lo < 1e-9) return {t: lo, eta: -1};
+  const bins = 64, span = hi - lo;
+  const hist = new Float64Array(bins);
+  for (let i = 0; i < n; i++) {
+    const v = vals[i];
+    if (v !== v) continue;
+    let b = ((v - lo) / span * bins) | 0;
+    if (b >= bins) b = bins - 1; else if (b < 0) b = 0;
+    hist[b]++;
+  }
+  const centers = new Float64Array(bins), wt = new Float64Array(bins);
+  let mu = 0;
+  for (let i = 0; i < bins; i++) {
+    centers[i] = lo + span * (i + 0.5) / bins;
+    wt[i] = hist[i] / count;
+    mu += wt[i] * centers[i];
+  }
+  let bestEta = -1, bestT = centers[0], w0 = 0, mu0 = 0;
+  for (let i = 0; i < bins; i++) {
+    w0 += wt[i]; mu0 += wt[i] * centers[i];
+    if (w0 <= 1e-6 || w0 >= 1 - 1e-6) continue;
+    const m0 = mu0 / w0, m1 = (mu - mu0) / (1 - w0);
+    const dm = m0 - m1, eta = w0 * (1 - w0) * dm * dm;
+    if (eta > bestEta) { bestEta = eta; bestT = centers[i]; }
+  }
+  let mean = 0;
+  for (let i = 0; i < n; i++) if (vals[i] === vals[i]) mean += vals[i];
+  mean /= count;
+  let vr = 0;
+  for (let i = 0; i < n; i++) {
+    const v = vals[i];
+    if (v !== v) continue;
+    const d = v - mean; vr += d * d;
+  }
+  vr /= count;
+  return {t: bestT, eta: vr > 1e-12 ? bestEta / vr : -1};
+}
+
+// Fraction of logical bits whose REPEAT copies all read the same.
+//
+// Sample bimodality cannot see the absolute rotation: turning the grid slides
+// each ring tangentially, so every cell still lands on either a seed or bare
+// dough and the samples stay just as bimodal -- an aliased rotation can even
+// out-score the true one. The copies of a logical bit sit in different
+// sectors, so a rotation shifts each of them by a different number of cells
+// and their agreement collapses. That makes this the score that actually pins
+// the rotation.
+function alignScore(img, w, h, prm) {
+  projectAll(prm);
+  const vals = CAM.vals, bits = CAM.bits, copies = CAM.copies;
+  sampleCells(img, w, h, vals);
+  const o = otsuF(vals);
+  if (!o) return -1;
+  const thr = o.t;
+  for (let i = 0; i < N_PHYSICAL; i++) {
+    const v = vals[i];
+    bits[i] = v === v ? (v > thr ? 1 : 0) : -1;
+  }
+  let agree = 0, tot = 0;
+  for (let g = 0; g < N_TOTAL_LOGICAL; g++) {
+    const base = g * REPEAT;
+    let mn = 2, mx = -2, finite = true;
+    for (let r = 0; r < REPEAT; r++) {
+      const b = bits[copies[base + r]];
+      if (b < 0) { finite = false; break; }
+      if (b < mn) mn = b;
+      if (b > mx) mx = b;
+    }
+    if (!finite) continue;
+    tot++;
+    if (mn === mx) agree++;
+  }
+  return tot < 64 ? -1 : agree / tot;
+}
+
+// Conic through the steepest radial transition of the seed energy between
+// rLo and rHi, taken per angle bin: descent finds the outer rim, ascent the
+// hole edge.
+function edgeConic(e, w, h, cx, cy, rLo, rHi, descent) {
+  const span = rHi - rLo;
+  if (span <= 1.0) return null;
+  const nb = 360, nsh = 64;
+  const S = new Float64Array(nb * nsh), C = new Float64Array(nb * nsh);
+  const x0 = Math.max(0, Math.floor(cx - rHi)), x1 = Math.min(w - 1, Math.ceil(cx + rHi));
+  const y0 = Math.max(0, Math.floor(cy - rHi)), y1 = Math.min(h - 1, Math.ceil(cy + rHi));
+  const invSpan = nsh / span, inv2pi = nb / (2 * Math.PI);
+  for (let y = y0; y <= y1; y++) {
+    const dy = y - cy, dy2 = dy * dy, o = y * w;
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx;
+      const r = Math.sqrt(dx * dx + dy2);
+      // Truncate toward zero, not floor: a radius just inside rLo lands in
+      // shell 0, which is what the Python side does. `| 0` truncates toward
+      // zero on both sides of the origin, so it covers the ceil branch too.
+      const sh = ((r - rLo) * invSpan) | 0;
+      if (sh < 0 || sh >= nsh) continue;
+      let bi = ((Math.atan2(dy, dx) + Math.PI) * inv2pi) | 0;
+      if (bi < 0) bi = 0; else if (bi > nb - 1) bi = nb - 1;
+      const idx = bi * nsh + sh;
+      S[idx] += e[o + x]; C[idx] += 1;
+    }
+  }
+
+  const P = new Float64Array(nb * nsh);
+  for (let b = 0; b < nb; b++) {
+    const o = b * nsh;
+    let mx = 0;
+    for (let j = 0; j < nsh; j++) {
+      const v = S[o + j] / Math.max(C[o + j], 1);
+      P[o + j] = v;
+      if (v > mx) mx = v;
+    }
+    // Normalise each angle bin by its own peak: under tilt the far side is
+    // compressed and its gradient is proportionally shallower.
+    const k = 1 / Math.max(mx, 1e-9);
+    for (let j = 0; j < nsh; j++) P[o + j] *= k;
+  }
+
+  const Ps = new Float64Array(nb * nsh);
+  for (let b = 0; b < nb; b++) {
+    const o = b * nsh;
+    for (let j = 0; j < nsh; j++) {
+      let s = 3 * P[o + j];
+      if (j > 0) { s += 2 * P[o + j - 1]; if (j > 1) s += P[o + j - 2]; }
+      if (j < nsh - 1) { s += 2 * P[o + j + 1]; if (j < nsh - 2) s += P[o + j + 2]; }
+      Ps[o + j] = s / 9;
+    }
+  }
+
+  const nd = nsh - 1;
+  const dP = new Float64Array(nb * nd);
+  for (let b = 0; b < nb; b++) {
+    const o = b * nsh, od = b * nd;
+    for (let j = 0; j < nd; j++) dP[od + j] = Ps[o + j + 1] - Ps[o + j];
+  }
+  const jj = new Int32Array(nb), depth = new Float64Array(nb);
+  for (let b = 0; b < nb; b++) {
+    const od = b * nd;
+    let best = 0, bv = dP[od];
+    for (let j = 1; j < nd; j++) {
+      const v = dP[od + j];
+      if (descent ? v < bv : v > bv) { bv = v; best = j; }
+    }
+    jj[b] = best; depth[b] = Math.abs(bv);
+  }
+  const sorted = Float64Array.from(depth).sort();
+  const cutoff = 0.20 * percentileSortedF(sorted, 70);
+  const seen = new Uint8Array(12);
+  let ngood = 0;
+  for (let b = 0; b < nb; b++) if (depth[b] > cutoff) { ngood++; seen[(b / 30) | 0] = 1; }
+  if (ngood < 200) return null;
+  let nsec = 0;
+  for (let s = 0; s < 12; s++) nsec += seen[s];
+  if (nsec < 10) return null;
+
+  const xs = [], ys = [];
+  for (let b = 0; b < nb; b++) {
+    if (depth[b] <= cutoff) continue;
+    const od = b * nd, j = jj[b];
+    const jl = j - 1 < 0 ? 0 : j - 1;
+    const jh = j + 1 > nd - 1 ? nd - 1 : j + 1;
+    const d0 = dP[od + jl], d1 = dP[od + j], d2 = dP[od + jh];
+    const den = d0 - 2 * d1 + d2;
+    let sub = Math.abs(den) > 1e-9 ? 0.5 * (d0 - d2) / den : 0;
+    sub = sub < -1 ? -1 : (sub > 1 ? 1 : sub);
+    const re = rLo + span * (j + 0.5 + sub) / nsh;
+    const tb = (b + 0.5) / nb * 2 * Math.PI - Math.PI;
+    xs.push(cx + re * Math.cos(tb));
+    ys.push(cy + re * Math.sin(tb));
+  }
+  return conicFit(xs, ys);
+}
+
+function conicOfCircle(prm, radius) {
+  const n = 90, xs = new Float64Array(n), ys = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = 2 * Math.PI * i / n;
+    const p = projectPoint(prm, radius * Math.cos(t), radius * Math.sin(t));
+    xs[i] = p[0]; ys[i] = p[1];
+  }
+  return conicFit(xs, ys);
+}
+
+// Two concentric canonical circles (seed rim, hole edge) project to the two
+// observed conics. Matching them recovers center, scale, tilt and keystone
+// together, including the perspective offset between a conic's center and the
+// projected grid center, which is exactly what makes a rim-only estimate
+// drift under tilt.
+function fitPoseConics(outer, hole, prmIn) {
+  const targets = [];
+  if (outer) targets.push([CANON_RIM_R, outer]);
+  if (hole) targets.push([CANON_HOLE_R, hole]);
+  const best = clonePose(prmIn);
+  if (!targets.length) return best;
+
+  function cost(p) {
+    let tot = 0;
+    for (let ti = 0; ti < targets.length; ti++) {
+      const radius = targets[ti][0], obs = targets[ti][1];
+      const c = conicOfCircle(p, radius);
+      if (!c) return 1e6;
+      const dcx = c.cx - obs.cx, dcy = c.cy - obs.cy;
+      tot += (dcx * dcx + dcy * dcy) / 4;
+      const da = c.a - obs.a;
+      tot += (da / 3) * (da / 3);
+      // A near-circular conic carries no axis information, and the small hole
+      // conic is too noisy for it: take squeeze and its direction only from a
+      // clearly eccentric outer rim.
+      const w = radius < 300 ? 0 : Math.min(Math.max((1 - obs.asp) / 0.05, 0), 1);
+      const dAsp = c.asp - obs.asp;
+      tot += w * (dAsp / 0.01) * (dAsp / 0.01);
+      const dpsi = pymod(c.psi - obs.psi + Math.PI / 2, Math.PI) - Math.PI / 2;
+      tot += w * (dpsi / 0.05) * (dpsi / 0.05);
+    }
+    return tot;
+  }
+
+  const keys = ['cx', 'cy', 'scale', 'aspect', 'theta', 'kx', 'ky'];
+  const nk = keys.length;
+  const steps = [4.0, 4.0, 0.02 * best.scale, 0.03, 0.08, 0.10, 0.10];
+  function fvec(v) {
+    const p = clonePose(best);
+    for (let i = 0; i < nk; i++) p[keys[i]] = v[i];
+    p.aspect = Math.min(Math.max(p.aspect, 0.3), 1.0);
+    return cost(p);
+  }
+  // Nelder-Mead: keystone and center trade off against each other, a valley
+  // coordinate descent cannot follow.
+  const sim = [], fv = [];
+  const base = keys.map(k => best[k]);
+  sim.push(base.slice());
+  for (let i = 0; i < nk; i++) { const v = base.slice(); v[i] += steps[i]; sim.push(v); }
+  for (let i = 0; i <= nk; i++) fv.push(fvec(sim[i]));
+  const order = new Array(nk + 1);
+  for (let it = 0; it < 160; it++) {
+    for (let i = 0; i <= nk; i++) order[i] = i;
+    order.sort((a, b) => fv[a] - fv[b]);
+    const ns = order.map(i => sim[i]), nf = order.map(i => fv[i]);
+    for (let i = 0; i <= nk; i++) { sim[i] = ns[i]; fv[i] = nf[i]; }
+    if (fv[nk] - fv[0] < 1e-7) break;
+    const cen = new Array(nk).fill(0);
+    for (let i = 0; i < nk; i++) for (let j = 0; j < nk; j++) cen[j] += sim[i][j];
+    for (let j = 0; j < nk; j++) cen[j] /= nk;
+    const worst = sim[nk];
+    const xr = cen.map((c, j) => c + (c - worst[j]));
+    const fr = fvec(xr);
+    if (fr < fv[0]) {
+      const xe = cen.map((c, j) => c + 2 * (c - worst[j]));
+      const fe = fvec(xe);
+      if (fe < fr) { sim[nk] = xe; fv[nk] = fe; } else { sim[nk] = xr; fv[nk] = fr; }
+    } else if (fr < fv[nk - 1]) {
+      sim[nk] = xr; fv[nk] = fr;
+    } else {
+      const xc = cen.map((c, j) => c + 0.5 * (worst[j] - c));
+      const fc = fvec(xc);
+      if (fc < fv[nk]) { sim[nk] = xc; fv[nk] = fc; }
+      else {
+        for (let i = 1; i <= nk; i++) {
+          const s0 = sim[0], si = sim[i];
+          const nv = new Array(nk);
+          for (let j = 0; j < nk; j++) nv[j] = s0[j] + 0.5 * (si[j] - s0[j]);
+          sim[i] = nv; fv[i] = fvec(nv);
+        }
+      }
+    }
+  }
+  let bo = 0;
+  for (let i = 1; i <= nk; i++) if (fv[i] < fv[bo]) bo = i;
+  for (let i = 0; i < nk; i++) best[keys[i]] = sim[bo][i];
+  best.aspect = Math.min(Math.max(best.aspect, 0.3), 1.0);
+  return best;
+}
+
+// Find the seed disc in the top-hat energy map: its centroid is the code
+// center, its RMS radius the scale, and its inertia the tilt axis and aspect.
+// Brightness, shading and background texture are already gone from resp, so
+// the disc is the only large structure left.
+function localizeDisc(resp, w, h) {
+  const n = w * h;
+  const rad = Math.max(3, Math.round(Math.min(h, w) / 90));
+  const sq = new Float64Array(n);
+  for (let i = 0; i < n; i++) sq[i] = resp[i] * resp[i];
+  const e = boxBlurF(sq, w, h, rad);
+  let emax = 0;
+  for (let i = 0; i < n; i++) if (e[i] > emax) emax = e[i];
+  if (!(emax > 0)) return null;
+  const thrE = 0.25 * emax;
+
+  let nIn = 0, tot = 0;
+  for (let i = 0; i < n; i++) { tot += e[i]; if (e[i] > thrE) nIn++; }
+  if (nIn < 300 || nIn >= n) return null;
+  const ixs = new Int32Array(nIn), iys = new Int32Array(nIn), wts = new Float64Array(nIn);
+  let k = 0, sumIn = 0;
+  for (let i = 0; i < n; i++) {
+    if (e[i] > thrE) {
+      ixs[k] = i % w; iys[k] = (i / w) | 0; wts[k] = e[i];
+      sumIn += e[i]; k++;
+    }
+  }
+  const contrast = (sumIn / nIn) / ((tot - sumIn) / (n - nIn) + 1e-9);
+  if (contrast < 2.5) return null;
+
+  let cx = 0, cy = 0;
+  for (let i = 0; i < nIn; i++) { cx += ixs[i]; cy += iys[i]; }
+  cx /= nIn; cy /= nIn;
+  let rms = 0;
+  for (let i = 0; i < nIn; i++) {
+    const dx = ixs[i] - cx, dy = iys[i] - cy;
+    rms += dx * dx + dy * dy;
+  }
+  rms = Math.sqrt(rms / nIn);
+
+  let keep = null;
+  for (let it = 0; it < 3; it++) {
+    // Re-center on the disc alone: background speckle that survived the
+    // threshold would otherwise drag the centroid several pixels, which is
+    // enough to flatten the scale landscape later on.
+    const rl = 1.5 * rms, rl2 = rl * rl;
+    const ks = [];
+    for (let i = 0; i < nIn; i++) {
+      const dx = ixs[i] - cx, dy = iys[i] - cy;
+      if (dx * dx + dy * dy <= rl2) ks.push(i);
+    }
+    if (ks.length < 300) return null;
+    keep = ks;
+    let sv = 0, sx = 0, sy = 0;
+    for (let a = 0; a < ks.length; a++) {
+      const i = ks[a], wk = wts[i];
+      sv += wk; sx += ixs[i] * wk; sy += iys[i] * wk;
+    }
+    cx = sx / sv; cy = sy / sv;
+    let s2 = 0;
+    for (let a = 0; a < ks.length; a++) {
+      const i = ks[a], dx = ixs[i] - cx, dy = iys[i] - cy;
+      s2 += dx * dx + dy * dy;
+    }
+    rms = Math.sqrt(s2 / ks.length);
+  }
+  if (!keep) return null;
+
+  let sv = 0, mu20 = 0, mu02 = 0, mu11 = 0;
+  for (let a = 0; a < keep.length; a++) {
+    const i = keep[a], wk = wts[i];
+    const dx = ixs[i] - cx, dy = iys[i] - cy;
+    sv += wk; mu20 += wk * dx * dx; mu02 += wk * dy * dy; mu11 += wk * dx * dy;
+  }
+  mu20 /= sv; mu02 /= sv; mu11 /= sv;
+  const tr = mu20 + mu02, det = mu20 * mu02 - mu11 * mu11;
+  const sqd = Math.sqrt(Math.max(tr * tr / 4 - det, 0));
+  const l1 = tr / 2 + sqd, l2 = Math.max(tr / 2 - sqd, 1e-9);
+  const cp = getRingParams(DEFAULT_IMAGE_SIZE);
+  // Area-uniform annulus between inner_r and outer_r: E[r^2]=(R^2+r0^2)/2
+  const rmsNorm = Math.sqrt((cp.outer_r * cp.outer_r + cp.inner_r * cp.inner_r) / 2);
+  let scale = Math.sqrt(Math.max(tr, 1e-9)) / rmsNorm;
+  if (scale <= 1e-6) return null;
+  let aspect = Math.sqrt(l2 / l1);
+  let theta = 0.5 * Math.atan2(2 * mu11, mu20 - mu02);
+  const rGuess = scale * cp.outer_r;
+
+  // The edge conic wants an unsmoothed energy map: the box blur that steadies
+  // the centroid pushes the steepest-descent edge outward by roughly two
+  // thirds of its radius, which is a 2-4% scale error on a small bagel and
+  // far outside the alignment capture basin.
+  const eEdge = boxBlurF(sq, w, h, Math.max(1, Math.round(Math.min(h, w) / 280)));
+  const outerC = edgeConic(eEdge, w, h, cx, cy, 0.60 * rGuess, 1.40 * rGuess, true);
+  const holeC = edgeConic(eEdge, w, h, cx, cy, 0.15 * rGuess, 0.55 * rGuess, false);
+  let kx = 0, ky = 0;
+  if (outerC) {
+    const rScale = outerC.a / CANON_RIM_R;
+    if (0.6 * scale < rScale && rScale < 1.4 * scale) {
+      cx = outerC.cx; cy = outerC.cy; scale = rScale;
+      aspect = outerC.asp; theta = outerC.psi;
+    }
+    if (aspect < 0.985) {
+      // Only worth the full pose fit under real tilt: the projected grid
+      // center stops coinciding with the rim ellipse's center, and the
+      // keystone terms are the only thing that can absorb the gap. Frontal
+      // shots are better served by the rim conic alone -- the hole conic is
+      // small and its edge sits several pixels outside the true hole, so
+      // pulling it into the fit inflates the scale past the alignment basin.
+      const pose = fitPoseConics(outerC, holeC,
+                                 {cx, cy, scale, aspect, theta, phi: 0, kx: 0, ky: 0});
+      cx = pose.cx; cy = pose.cy; scale = pose.scale;
+      aspect = pose.aspect; theta = pose.theta; kx = pose.kx; ky = pose.ky;
+    }
+  }
+  if (aspect > 0.985) {
+    // Tilt below ~17 degrees is not worth modelling, and any residual squeeze
+    // at that level is fit noise: a 1% squeeze along a random axis costs more
+    // alignment than it explains.
+    aspect = 1.0; theta = 0.0;
+  }
+  return {prm: {cx, cy, scale, aspect: Math.min(Math.max(aspect, 0.3), 1.0),
+                theta, phi: 0, kx, ky}, contrast};
+}
+
+// Copy agreement dies outside roughly +-3px of center and +-1% of scale, but
+// a bagel pushed toward the frame edge localizes 15px out, so the rounds
+// start wide and narrow from there.
+const COARSE_ROUNDS = [
+  [8.0, 4.0, 0.06],
+  [4.0, 2.0, 0.04],
+  [2.0, 1.0, 0.02],
+  [1.0, 0.5, 0.01],
+  [0.5, 0.25, 0.004]
+];
+
+// Snap the disc-moment pose onto the alignment optimum.
+//
+// Center and scale are searched jointly rather than one axis at a time,
+// because at this resolution a center error can only be paid for by a scale
+// error and vice versa.
+//
+// Rotation and geometry have to be ordered, and which order works depends on
+// which of the two the localization got wrong. Shot straight on, the center
+// lands within a pixel or two, so the rotation scan is already meaningful and
+// picks up the roll at once. Pushed toward the frame edge the center lands
+// several pixels out, and then the rotation scan is worse than useless: a
+// couple of pixels of center error already moves the agreement argmax tens of
+// degrees, so it locks onto an alias and the geometry search that follows has
+// no basin left to find. So scan rotation first, and only when that lands
+// somewhere poor fall back to fixing the geometry first.
+function coarsePose(resp, w, h, prmIn, kPhi) {
+  if (kPhi === undefined) kPhi = 3;
+  const s0 = prmIn.scale;
+  const lo = 0.85 * s0, hiS = 1.18 * s0;
+  // The ring grid is radially self-similar, so half/double scale also lands
+  // on seeds; the disc radius from localizeDisc rules those harmonics out.
+  function trySet(base, ov) {
+    const p = clonePose(base);
+    for (const key in ov) p[key] = ov[key];
+    p.aspect = Math.min(Math.max(p.aspect, 0.3), 1.0);
+    p.scale = Math.min(Math.max(p.scale, lo), hiS);
+    return {p, s: alignScore(resp, w, h, p)};
+  }
+  function geomRounds(start, score) {
+    let best = clonePose(start);
+    for (let i = 0; i < COARSE_ROUNDS.length; i++) {
+      const crange = COARSE_ROUNDS[i][0], cstep = COARSE_ROUNDS[i][1], srange = COARSE_ROUNDS[i][2];
+      const offs = arangeF(-crange, crange + 1e-9, cstep);
+      for (let a = 0; a < offs.length; a++) {
+        for (let b = 0; b < offs.length; b++) {
+          const r = trySet(best, {cx: best.cx + offs[a], cy: best.cy + offs[b]});
+          if (r.s > score) { score = r.s; best = r.p; }
+        }
+      }
+      const ms = linspaceF(1 - srange, 1 + srange, 9);
+      for (let a = 0; a < ms.length; a++) {
+        const r = trySet(best, {scale: best.scale * ms[a]});
+        if (r.s > score) { score = r.s; best = r.p; }
+      }
+      if (i === 1) {
+        // Aspect and its axis are coupled: a compression along the wrong axis
+        // scores worse than none at all. Swept once the widest center round
+        // has landed, not before -- at a bad center a squeeze can only
+        // compensate for the offset and the pair then locks together.
+        const asps = [0.70, 0.80, 0.88, 0.94, 1.0];
+        const ths = arangeF(0, Math.PI, Math.PI / 8);
+        for (let a = 0; a < asps.length; a++)
+          for (let b = 0; b < ths.length; b++) {
+            const r = trySet(best, {aspect: asps[a], theta: ths[b]});
+            if (r.s > score) { score = r.s; best = r.p; }
+          }
+      }
+    }
+    return {best, score};
+  }
+  function rotateThenGeom(start) {
+    let best = clonePose(start);
+    let score = alignScore(resp, w, h, best);
+    for (const pk of phiPeaks(resp, w, h, best, 1.0, 0.25, kPhi, 20.0)) {
+      const g = geomRounds(pk.prm, alignScore(resp, w, h, pk.prm));
+      if (g.score > score) { best = g.best; score = g.score; }
+    }
+    return {best, score};
+  }
+
+  let out = rotateThenGeom(prmIn);
+  if (out.score < 0.8) {
+    const gf = geomRounds(prmIn, alignScore(resp, w, h, prmIn));
+    let alt = rotateThenGeom(gf.best);
+    if (gf.score > alt.score) alt = gf;
+    if (alt.score > out.score) out = alt;
+  }
+  return out;
+}
+
+// Step sizes stay inside the measured tolerances: scale +-0.5%, center
+// +-1.5px, aspect +-0.01, keystone +-0.03, rotation +-0.3deg. Coarser sweeps
+// drift past the optimum because the alignment score is flat and noisy there.
+const DESCENT_ROUNDS = [
+  [['scale', linspaceF(0.994, 1.006, 9), true],
+   ['cx', arangeF(-1.5, 1.51, 0.5), false],
+   ['cy', arangeF(-1.5, 1.51, 0.5), false],
+   ['aspect', arangeF(-0.012, 0.0121, 0.003), false],
+   ['theta', arangeF(-0.024, 0.0241, 0.006), false],
+   ['kx', arangeF(-0.06, 0.061, 0.015), false],
+   ['ky', arangeF(-0.06, 0.061, 0.015), false]],
+  [['scale', linspaceF(0.9985, 1.0015, 7), true],
+   ['cx', arangeF(-0.4, 0.41, 0.2), false],
+   ['cy', arangeF(-0.4, 0.41, 0.2), false],
+   ['aspect', arangeF(-0.004, 0.0041, 0.001), false],
+   ['theta', arangeF(-0.008, 0.0081, 0.002), false],
+   ['kx', arangeF(-0.02, 0.021, 0.005), false],
+   ['ky', arangeF(-0.02, 0.021, 0.005), false]]
+];
+
+// Residual geometry error the descent can still leave behind; the real
+// decoder arbitrates over these variants.
+const GEOM_VARIANTS = [
+  {},
+  {scale: 1.0025}, {scale: 0.9975},
+  {cx: 0.6}, {cx: -0.6}, {cy: 0.6}, {cy: -0.6},
+  {aspect: 0.004}, {aspect: -0.004},
+  {kx: 0.02}, {ky: 0.02}, {kx: -0.02}, {ky: -0.02}
+];
+
+function descendPose(resp, w, h, prmIn, scoreIn) {
+  let prm = clonePose(prmIn), score = scoreIn;
+  for (const spec of DESCENT_ROUNDS) {
+    for (const [key, deltas, mult] of spec) {
+      for (let i = 0; i < deltas.length; i++) {
+        const p = clonePose(prm);
+        p[key] = mult ? prm[key] * deltas[i] : prm[key] + deltas[i];
+        if (key === 'aspect') p[key] = Math.min(Math.max(p[key], 0.3), 1.0);
+        const s = alignScore(resp, w, h, p);
+        if (s > score) { score = s; prm = p; }
+      }
+    }
+  }
+  return {prm, score};
+}
+
+function phiScan(resp, w, h, prm, degStep) {
+  const out = [];
+  const n = Math.max(0, Math.ceil((360.0 - 0.0) / degStep));
+  for (let i = 0; i < n; i++) {
+    const p = clonePose(prm);
+    p.phi = i * degStep * Math.PI / 180;
+    out.push({score: alignScore(resp, w, h, p), deg: i * degStep});
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
+
+function phiPeaks(resp, w, h, prm, degStep, fineStep, kPeaks, sepDeg) {
+  const peaks = [], chosen = [];
+  for (const cand of phiScan(resp, w, h, prm, degStep)) {
+    let clash = false;
+    for (const o of chosen) {
+      const d = Math.abs(cand.deg - o);
+      if (Math.min(d, 360 - d) < sepDeg) { clash = true; break; }
+    }
+    if (clash) continue;
+    const local = [{score: cand.score, deg: cand.deg}];
+    const n = Math.max(0, Math.ceil((2 * degStep + 1e-9) / fineStep));
+    for (let i = 0; i < n; i++) {
+      const deg = pymod(cand.deg - degStep + i * fineStep, 360);
+      const p = clonePose(prm);
+      p.phi = deg * Math.PI / 180;
+      local.push({score: alignScore(resp, w, h, p), deg});
+    }
+    local.sort((a, b) => b.score - a.score);
+    const p = clonePose(prm);
+    p.phi = local[0].deg * Math.PI / 180;
+    peaks.push({score: local[0].score, prm: p});
+    chosen.push(local[0].deg);
+    if (peaks.length >= kPeaks) break;
+  }
+  peaks.sort((a, b) => b.score - a.score);
+  return peaks;
+}
+
+// Find the in-plane rotation, then tighten the rest of the pose.
+//
+// coarsePose has already put the center and scale inside the agreement basin,
+// so the rotation scan is now meaningful: it runs at 1deg, coarse enough to
+// bracket the peak since agreement is already down to ~0.5 half a degree out,
+// and only then is the geometry descended and the rotation rescanned at
+// 0.1deg. The top peaks are all returned, ranked, for the decoder to arbitrate.
+function refinePose(resp, w, h, prmIn, kPeaks) {
+  if (kPeaks === undefined) kPeaks = 3;
+  const out = [];
+  for (const pk of phiPeaks(resp, w, h, prmIn, 1.0, 0.1, kPeaks, 3.0)) {
+    const d = descendPose(resp, w, h, pk.prm, pk.score);
+    const fine = [{score: d.score, prm: d.prm}];
+    const step = 0.05 * Math.PI / 180;
+    const lo = d.prm.phi - 0.5 * Math.PI / 180;
+    const n = Math.ceil((1.0 * Math.PI / 180 + 1e-12) / step);
+    for (let i = 0; i < n; i++) {
+      const p = clonePose(d.prm);
+      p.phi = lo + i * step;
+      fine.push({score: alignScore(resp, w, h, p), prm: p});
+    }
+    fine.sort((a, b) => b.score - a.score);
+    out.push(fine[0], fine[1]);
+  }
+  out.sort((a, b) => b.score - a.score);
+  return {best: out[0].prm, peaks: out};
+}
+
+// Hard 0/1 decisions plus an erasure band. The band comes from each mode's own
+// spread (MAD), not from the gap between the modes: a gap-proportional band
+// eats the whole tail of the broader mode and skews the vote, while MAD scales
+// with the actual noise, so a blurry low-contrast shot widens it (more
+// erasures for RS to use) and a clean one keeps almost every cell decisive.
+function classifyCells(vals, hit) {
+  const o = otsuF(vals);
+  if (!o) return null;
+  const thr = o.t;
+  const below = [], above = [];
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i];
+    if (v !== v) continue;
+    if (v < thr) below.push(v); else above.push(v);
+  }
+  if (below.length < 100 || above.length < 100) return null;
+  const m0 = medianF(below), m1 = medianF(above);
+  const gap = Math.abs(m1 - m0);
+  if (gap <= 1e-6) return null;
+  const a0 = new Float64Array(below.length), a1 = new Float64Array(above.length);
+  for (let i = 0; i < below.length; i++) a0[i] = Math.abs(below[i] - m0);
+  for (let i = 0; i < above.length; i++) a1[i] = Math.abs(above[i] - m1);
+  const s0 = medianF(a0), s1 = medianF(a1);
+  const floorV = 0.05 * gap;
+  const loCut = thr - Math.max(1.3 * s0, floorV);
+  const hiCut = thr + Math.max(1.3 * s1, floorV);
+  const out = new Array(N_PHYSICAL).fill(null);
+  for (let i = 0; i < N_PHYSICAL; i++) {
+    if (hit[i]) continue;
+    const v = vals[i];
+    if (v !== v) continue;
+    if (v > hiCut) out[i] = 1;
+    else if (v < loCut) out[i] = 0;
+  }
+  return out;
+}
+
+// Yields cell readings for ranked pose candidates; the caller decodes them in
+// order and stops at the first payload whose header and SHA-256 check out.
+function* cameraPoseCandidates(gray, w, h) {
+  if (Math.min(h, w) < 40) return;
+  CAM.init();
+
+  const f0 = ANALYZE_MAX_DIM / Math.max(h, w);
+  let aGray, aw, ah, f;
+  if (f0 < 1.0) {
+    aw = Math.max(8, Math.round(w * f0));
+    ah = Math.max(8, Math.round(h * f0));
+    aGray = boxResizeF(gray, w, h, aw, ah);
+    f = f0;
+  } else {
+    aGray = gray; aw = w; ah = h; f = 1.0;
+  }
+
+  const loc = localizeDisc(tophatF(aGray, aw, ah, 5), aw, ah);
+  if (!loc) return;
+  const prm = loc.prm;
+  prm.cx /= f; prm.cy /= f; prm.scale /= f;
+
+  const thK = Math.max(3, Math.round(12.0 * prm.scale));
+  const resp = tophatF(gray, w, h, thK);
+  // A quarter of the cell pitch: enough to average out grain inside a cell,
+  // and it truncates to zero once cells are only a few pixels across, where
+  // any blur at all smears seeds into their neighbours.
+  const smRad = Math.min(Math.trunc(2.25 * prm.scale), 28);
+  const respS = boxBlurF(resp, w, h, smRad);
+
+  const coarse = coarsePose(respS, w, h, prm);
+  const refined = refinePose(respS, w, h, coarse.best);
+
+  const dmgRad = Math.max(2, Math.round(3.0 * coarse.best.scale));
+  let gmax = 0;
+  for (let i = 0; i < gray.length; i++) if (gray[i] > gmax) gmax = gray[i];
+  const wf = borderWhiteF(gray, w, h, Math.max(245.0, 0.98 * gmax));
+  const dil = movExtremeF(Float64Array.from(wf), w, h, 2 * dmgRad + 1, false);
+
+  const vals = new Float64Array(N_PHYSICAL);
+  for (const pk of refined.peaks) {
+    for (const variant of GEOM_VARIANTS) {
+      const p = clonePose(pk.prm);
+      for (const key in variant) {
+        p[key] = key === 'scale' ? p[key] * variant[key] : p[key] + variant[key];
+        if (key === 'aspect') p[key] = Math.min(Math.max(p[key], 0.3), 1.0);
+      }
+      projectAll(p);
+      sampleCells(respS, w, h, vals);
+      let nValid = 0;
+      for (let i = 0; i < N_PHYSICAL; i++) if (vals[i] === vals[i]) nValid++;
+      if (nValid < 0.35 * N_PHYSICAL) continue;
+      const hit = new Uint8Array(N_PHYSICAL);
+      const {xs, ys} = CAM;
+      for (let i = 0; i < N_PHYSICAL; i++) {
+        let xi = (xs[i] + 0.5) | 0; if (xi < 0) xi = 0; else if (xi > w - 1) xi = w - 1;
+        let yi = (ys[i] + 0.5) | 0; if (yi < 0) yi = 0; else if (yi > h - 1) yi = h - 1;
+        hit[i] = dil[yi * w + xi] > 0 ? 1 : 0;
+      }
+      const raw = classifyCells(vals, hit);
+      if (raw) yield raw;
+    }
+  }
+}
+
+// Deinterleave -> majority vote -> de-whiten -> RS. Shared by both front ends
+// so they can be tried in sequence.
+function backendDecode(rawValues, rs, tryHard) {
+  CAM.init();
+  const p2l = CAM._inter.physicalToLogical;
+  const ordered = new Array(N_PHYSICAL).fill(null);
+  const n = Math.min(N_PHYSICAL, rawValues.length);
+  for (let i = 0; i < n; i++) ordered[p2l[i]] = rawValues[i];
+
+  const whit = CAM._whit;
+  const logical = new Array(N_TOTAL_LOGICAL), logicalErased = new Array(N_TOTAL_LOGICAL);
+  for (let g = 0; g < N_TOTAL_LOGICAL; g++) {
+    let ones = 0, zeros = 0, nones = 0;
+    for (let r = 0; r < REPEAT; r++) {
+      const v = ordered[g * REPEAT + r];
+      if (v === 1) ones++; else if (v === 0) zeros++; else nones++;
+    }
+    const b = ones > zeros ? 1 : (zeros > ones ? 0 : whit[g]);
+    logical[g] = b ^ whit[g];
+    logicalErased[g] = nones >= 3;
+  }
+  const result = tryDecodeWithLogical(logical, logicalErased, rs);
+  if (result) return result;
+  return tryHard ? exhaustiveDecode(logical, logicalErased, rs) : null;
+}
+
+// ============================================================
 // Decoder
 // ============================================================
-function decodeFromImage(imgElement) {
-  const w = imgElement.naturalWidth || imgElement.videoWidth || imgElement.width;
-  const h = imgElement.naturalHeight || imgElement.videoHeight || imgElement.height;
-  const tmpCanvas = document.createElement('canvas');
-  tmpCanvas.width = w; tmpCanvas.height = h;
-  const tmpCtx = tmpCanvas.getContext('2d');
-  tmpCtx.drawImage(imgElement, 0, 0);
-  const imgData = tmpCtx.getImageData(0, 0, w, h);
-  const px = imgData.data;
+// RGBA buffer in, decoded text out. This is the single entry point for every
+// decode path, and it is deliberately DOM-free so the whole block above the
+// `// UI` banner can be lifted verbatim into a worker.
+function decodePixels(px, w, h, tryHard) {
+  if (tryHard === undefined) tryHard = true;
+  const gray = new Float64Array(w * h);
+  for (let i = 0, p = 0; i < gray.length; i++, p += 4)
+    gray[i] = (px[p] + px[p + 1] + px[p + 2]) / 3;
 
+  const rs = new RSCodec(DEFAULT_EC);
+  const deferred = [];
+  for (const raw of cameraPoseCandidates(gray, w, h)) {
+    const r = backendDecode(raw, rs, false);
+    if (r) return r;
+    // The exhaustive backend sweeps every plausible payload length, so it
+    // costs seconds per candidate. Only the best-ranked poses are worth that;
+    // the rest are geometry the cheap pass already rejected by a wide margin.
+    if (tryHard && deferred.length < 4) deferred.push(raw);
+  }
+  for (const raw of deferred) {
+    const r = backendDecode(raw, rs, true);
+    if (r) return r;
+  }
+  return decodeLegacy(px, w, h, rs, tryHard);
+}
+
+// Pre-camera path: assumes the bagel is upright and roughly fills the frame.
+// Kept as the fallback because it is far cheaper, and a clean uploaded render
+// still hits it whenever the pose search misses.
+function decodeLegacy(px, w, h, rs, tryHard) {
   function getBri(x, y) {
     x = Math.max(0, Math.min(w-1, x)); y = Math.max(0, Math.min(h-1, y));
     const i = (y*w+x)*4;
@@ -700,7 +1912,7 @@ function decodeFromImage(imgElement) {
   }
 
   const circle = detectBagelCircle(w, h, getBri);
-  if (!circle) throw new Error('无法检测贝果圆环');
+  if (!circle) return null;
 
   // Normalize to canonical space
   const ccx = DEFAULT_IMAGE_SIZE/2, ccy = DEFAULT_IMAGE_SIZE/2;
@@ -708,25 +1920,24 @@ function decodeFromImage(imgElement) {
   // Scale from seed-ring radii stays correct when the rim is cropped/damaged
   const ringScale = estimateScaleFromRings(px, w, h, circle.ccx, circle.ccy, circle.detectedInnerR);
   const scale = ringScale !== null ? ringScale : cp.outer_r / Math.max(circle.detectedOuterR, 1);
-  const nc = document.createElement('canvas');
-  nc.width = DEFAULT_IMAGE_SIZE; nc.height = DEFAULT_IMAGE_SIZE;
-  const nctx = nc.getContext('2d');
-  nctx.fillStyle = '#FFF'; nctx.fillRect(0,0,DEFAULT_IMAGE_SIZE,DEFAULT_IMAGE_SIZE);
-  const nimg = nctx.getImageData(0,0,DEFAULT_IMAGE_SIZE,DEFAULT_IMAGE_SIZE);
-  const nd = nimg.data;
+  // Nearest-neighbour resample into canonical space, on white. The buffer is
+  // built by hand rather than through a canvas so this stays DOM-free and can run
+  // in the worker; a putImageData/getImageData round trip returns byte-identical
+  // data anyway, so the canvas bought nothing here.
+  const nd = new Uint8ClampedArray(DEFAULT_IMAGE_SIZE * DEFAULT_IMAGE_SIZE * 4);
+  nd.fill(255);
   for (let py = 0; py < DEFAULT_IMAGE_SIZE; py++) {
     for (let ppx = 0; ppx < DEFAULT_IMAGE_SIZE; ppx++) {
       const sx = (ppx - ccx)/scale + circle.ccx;
       const sy = (py - ccy)/scale + circle.ccy;
       if (sx >= 0 && sx < w-1 && sy >= 0 && sy < h-1) {
-        const si = (Math.floor(sy)*w + Math.floor(sx))*4;
+        const si = ((sy | 0)*w + (sx | 0))*4;
         const di = (py*DEFAULT_IMAGE_SIZE+ppx)*4;
         nd[di]=px[si]; nd[di+1]=px[si+1]; nd[di+2]=px[si+2]; nd[di+3]=255;
       }
     }
   }
-  nctx.putImageData(nimg, 0, 0);
-  const cdata = nctx.getImageData(0,0,DEFAULT_IMAGE_SIZE,DEFAULT_IMAGE_SIZE).data;
+  const cdata = nd;
   function cBri(x,y) {
     x = Math.max(0, Math.min(DEFAULT_IMAGE_SIZE-1, Math.round(x)));
     y = Math.max(0, Math.min(DEFAULT_IMAGE_SIZE-1, Math.round(y)));
@@ -734,34 +1945,10 @@ function decodeFromImage(imgElement) {
     return (cdata[i]+cdata[i+1]+cdata[i+2])/3;
   }
 
-  const grid = buildPolarGrid(ccx, ccy, cp.inner_r+4, cp.outer_r-4, SESAME_SPACING, CANONICAL_GRID_COUNT);
+  const grid = CAM.grid();
   const damage = borderWhiteMask(cdata, DEFAULT_IMAGE_SIZE);
   const rawValues = readPresence(grid, cBri, damage);
-
-  // Use the SAME interleaver size as encoder (full grid)
-  const rs = new RSCodec(DEFAULT_EC);
-  const fullInterleaver = new SectorInterleaver(grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
-  const allOrdered = fullInterleaver.deinterleaveWithErasures(rawValues.slice(0, N_PHYSICAL));
-
-  // Majority vote per REPEAT group, then de-whiten
-  const whit = whiteningSequence(N_TOTAL_LOGICAL);
-  const logical = [], logicalErased = [];
-  for (let g = 0; g < N_TOTAL_LOGICAL; g++) {
-    const group = allOrdered.slice(g*REPEAT, (g+1)*REPEAT);
-    const ones = group.filter(v=>v===1).length;
-    const zeros = group.filter(v=>v===0).length;
-    const nones = group.filter(v=>v===null||v===undefined).length;
-    const b = ones > zeros ? 1 : (zeros > ones ? 0 : whit[g]);
-    logical.push(b ^ whit[g]);
-    logicalErased.push(nones >= 3);
-  }
-
-  // Try metadata-guided decode
-  const result = tryDecodeWithLogical(logical, logicalErased, rs);
-  if (result) return result;
-
-  // Exhaustive fallback
-  return exhaustiveDecode(logical, logicalErased, rs);
+  return backendDecode(rawValues, rs, tryHard);
 }
 
 function tryDecodeWithLogical(logical, logicalErased, rs) {
@@ -1098,20 +2285,25 @@ function doDecode() {
         resultDiv=document.getElementById('decode-result'),errDiv=document.getElementById('decode-error');
   btn.disabled=true; status.textContent='正在解码...';
   errDiv.classList.add('hidden'); resultDiv.classList.add('hidden');
-  try {
-    const result = decodeFromImage(uploadedImage);
-    if (result) {
-      showResult(result);
-      status.textContent='解码成功!';
-    } else { showError('decode-error','解码失败，无法识别芝码'); status.textContent=''; }
-  } catch(e) { showError('decode-error',e.message); status.textContent=''; }
-  btn.disabled=false;
+  let img;
+  try { img = imagePixels(uploadedImage); }
+  catch(e) { showError('decode-error',e.message); status.textContent=''; btn.disabled=false; return; }
+  decodePixelsAsync(img.data, img.width, img.height, true, result => {
+    if (result) { showResult(result); status.textContent='解码成功!'; }
+    else { showError('decode-error','解码失败，无法识别芝码'); status.textContent=''; }
+    btn.disabled=false;
+  });
 }
 
 function showResult(result) {
   const resultDiv=document.getElementById('decode-result');
   const safe=escapeHtml(result);
-  resultDiv.innerHTML = `<p>解码结果:</p><a href="${safe}" target="_blank" rel="noopener">${safe}</a><div class="actions"><a class="btn btn-secondary" href="${safe}" target="_blank" rel="noopener">跳转链接</a></div>`;
+  // Only http(s) payloads become clickable. A decoded string is attacker-
+  // controlled input -- anyone can print a bagel -- so anything else (plain
+  // text, a hex dump of a non-UTF8 payload, a javascript: URL) is shown inert.
+  resultDiv.innerHTML = isSafeHttpUrl(result)
+    ? `<p>解码结果:</p><a href="${safe}" target="_blank" rel="noopener">${safe}</a><div class="actions"><a class="btn btn-secondary" href="${safe}" target="_blank" rel="noopener">跳转链接</a></div>`
+    : `<p>解码结果:</p><pre class="raw-payload">${safe}</pre>`;
   resultDiv.classList.remove('hidden');
   document.getElementById('decode-error').classList.add('hidden');
 }
@@ -1136,8 +2328,109 @@ let camAuto = true;
 let camTorchOn = false;
 let camFrames = 0;
 const camCanvas = document.createElement('canvas');
+// One-shot capture keeps the extra resolution; the live loop trades it for
+// frame rate, since a missed decode costs nothing there and the next frame is
+// only 120ms away.
 const CAM_MAX_DIM = 1280;
-const CAM_INTERVAL_MS = 260;
+const CAM_LIVE_MAX_DIM = 900;
+const CAM_INTERVAL_MS = 120;
+
+// ------------------------------------------------------------
+// Off-thread decoding
+//
+// A camera frame costs on the order of a second to localize, align and
+// decode. On the UI thread that freezes the viewfinder for the whole time,
+// which reads as a hung page rather than a scanner. So the codec runs in a
+// worker built from this same script element: everything above the `// UI`
+// banner is pure numeric code with no DOM access, and slicing it out keeps a
+// single source of truth instead of a second copy that can drift.
+// ------------------------------------------------------------
+const WORKER_GLUE = `
+onmessage = function (e) {
+  const d = e.data;
+  let result = null;
+  try { result = decodePixels(d.px, d.w, d.h, d.tryHard); } catch (err) { result = null; }
+  postMessage({id: d.id, result: result});
+};
+`;
+
+let codecWorker = null;
+let codecWorkerDead = false;
+let decodeSeq = 0;
+const decodePending = new Map();
+
+function getCodecWorker() {
+  if (codecWorker || codecWorkerDead) return codecWorker;
+  try {
+    const full = document.getElementById('codec-src').textContent;
+    const ui = full.indexOf('\n// UI\n');
+    const cut = full.lastIndexOf('// =====', ui);
+    if (ui < 0 || cut < 0) throw new Error('codec markers not found');
+    const url = URL.createObjectURL(
+      new Blob([full.slice(0, cut), WORKER_GLUE], {type: 'text/javascript'}));
+    const wk = new Worker(url);
+    URL.revokeObjectURL(url);
+    wk.onmessage = e => {
+      const cb = decodePending.get(e.data.id);
+      if (!cb) return;
+      decodePending.delete(e.data.id);
+      cb(e.data.result);
+    };
+    wk.onerror = () => {
+      // Blob workers are refused under file:// and some strict CSPs; fall back
+      // to decoding inline rather than losing the feature entirely.
+      codecWorkerDead = true;
+      codecWorker = null;
+      wk.terminate();
+      const stale = Array.from(decodePending.values());
+      decodePending.clear();
+      for (const cb of stale) cb(null);
+    };
+    codecWorker = wk;
+  } catch (e) {
+    codecWorkerDead = true;
+    codecWorker = null;
+  }
+  return codecWorker;
+}
+
+function decodePixelsAsync(px, w, h, tryHard, cb) {
+  const wk = getCodecWorker();
+  if (!wk) {
+    setTimeout(() => {
+      let r = null;
+      try { r = decodePixels(px, w, h, tryHard); } catch (e) { r = null; }
+      cb(r);
+    }, 0);
+    return;
+  }
+  const id = ++decodeSeq;
+  decodePending.set(id, cb);
+  wk.postMessage({id, px, w, h, tryHard}, [px.buffer]);
+}
+
+// Grab the current viewfinder as RGBA at a capped long edge.
+function grabFrame(video, maxDim) {
+  const s = Math.min(1, maxDim / Math.max(video.videoWidth, video.videoHeight));
+  const w = Math.max(1, Math.round(video.videoWidth * s));
+  const h = Math.max(1, Math.round(video.videoHeight * s));
+  camCanvas.width = w; camCanvas.height = h;
+  const ctx = camCanvas.getContext('2d', {willReadFrequently: true});
+  ctx.drawImage(video, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h);
+}
+
+// Rasterize an <img> to RGBA at its natural size.
+function imagePixels(img) {
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (!w || !h) throw new Error('图片尚未加载');
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', {willReadFrequently: true});
+  ctx.drawImage(img, 0, 0);
+  return ctx.getImageData(0, 0, w, h);
+}
 
 async function openCamera() {
   const overlay=document.getElementById('cam-overlay');
@@ -1199,31 +2492,23 @@ function scheduleScan(delay) {
 
 function scanFrame() {
   const video=document.getElementById('cam-video');
-  if (!camStream || camBusy) return;
+  if (!camStream || camBusy || !camAuto) return;
   if (!video.videoWidth || video.readyState < 2) { scheduleScan(CAM_INTERVAL_MS); return; }
-  if (!camAuto) return;
 
-  // Downscale once here rather than letting decodeFromImage allocate a
-  // full-resolution canvas per frame: the seed pitch is ~9px on a 1024px
-  // render, so 1280px still leaves several pixels per cell.
-  const s = Math.min(1, CAM_MAX_DIM / Math.max(video.videoWidth, video.videoHeight));
-  camCanvas.width = Math.round(video.videoWidth * s);
-  camCanvas.height = Math.round(video.videoHeight * s);
-  camCanvas.getContext('2d', {willReadFrequently:true}).drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
-
+  const frame = grabFrame(video, CAM_LIVE_MAX_DIM);
   camBusy = true;
   camFrames++;
-  // Decode is synchronous and can take a few hundred ms on a phone, so it
-  // goes on a task boundary to let the viewfinder paint first.
-  setTimeout(() => {
-    let result = null;
-    try { result = decodeFromImage(camCanvas); } catch(e) { /* no bagel in frame yet */ }
+  // tryHard=false: the exhaustive backend costs seconds per candidate and the
+  // next frame arrives in a fraction of that, so retrying cheaply beats
+  // grinding on one bad frame.
+  decodePixelsAsync(frame.data, frame.width, frame.height, false, result => {
     camBusy = false;
+    if (!camAuto || !camStream) return;   // overlay closed while we were working
     if (result) { onCameraSuccess(result); return; }
     document.getElementById('cam-hint').textContent =
       `未识别，正在重试… (第 ${camFrames} 帧)`;
     scheduleScan(CAM_INTERVAL_MS);
-  }, 0);
+  });
 }
 
 function captureStill() {
@@ -1231,28 +2516,34 @@ function captureStill() {
   if (!video.videoWidth) return;
   camAuto = false;
   clearTimeout(camTimer);
-  const s = Math.min(1, CAM_MAX_DIM / Math.max(video.videoWidth, video.videoHeight));
-  camCanvas.width = Math.round(video.videoWidth * s);
-  camCanvas.height = Math.round(video.videoHeight * s);
-  camCanvas.getContext('2d', {willReadFrequently:true}).drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
+  // Freeze the frame on screen so the user is looking at what gets decoded.
+  const frame = grabFrame(video, CAM_MAX_DIM);
+  const frozen = document.createElement('canvas');
+  frozen.width = frame.width; frozen.height = frame.height;
+  frozen.getContext('2d').putImageData(frame, 0, 0);
+  video.srcObject = null;
   document.getElementById('cam-hint').textContent='正在解码…';
-  let result = null;
-  try { result = decodeFromImage(camCanvas); } catch(e) { result = null; }
-  if (result) { onCameraSuccess(result); return; }
-  // Show the frozen frame so the user can see what the decoder saw.
-  uploadedImage = new Image();
-  uploadedImage.src = camCanvas.toDataURL('image/png');
-  document.getElementById('decode-img').src = uploadedImage.src;
-  document.getElementById('decode-preview').classList.remove('hidden');
-  document.getElementById('decode-btn').disabled = false;
-  closeCamera();
-  showError('decode-error','这一帧没能识别，可点「解码芝码」用已保存的画面重试，或换个角度重拍');
+  decodePixelsAsync(frame.data, frame.width, frame.height, true, result => {
+    if (result) { onCameraSuccess(result); return; }
+    uploadedImage = new Image();
+    uploadedImage.src = frozen.toDataURL('image/png');
+    document.getElementById('decode-img').src = uploadedImage.src;
+    document.getElementById('decode-preview').classList.remove('hidden');
+    document.getElementById('decode-btn').disabled = false;
+    closeCamera();
+    showError('decode-error','这一帧没能识别，可点「解码芝码」用已保存的画面重试，或换个角度重拍');
+  });
 }
 
 function onCameraSuccess(result) {
   closeCamera();
   showResult(result);
   document.getElementById('decode-status').textContent = `解码成功! (扫描 ${camFrames} 帧)`;
+  // "抬手扫描即跳转": a scanned code is meant to be followed, not read. Only
+  // http(s) payloads navigate -- anything else (arbitrary text, a hex dump of
+  // a non-UTF8 payload) is displayed instead, which also rules out a
+  // javascript: URL smuggled in through an image.
+  if (isSafeHttpUrl(result)) setTimeout(() => { window.location.href = result; }, 600);
 }
 
 function closeCamera() {
@@ -1272,6 +2563,15 @@ function showError(id, msg) {
 }
 function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Decoded payloads are untrusted input: only real http(s) URLs are ever turned
+// into a link or navigated to.
+function isSafeHttpUrl(s) {
+  if (typeof s !== 'string' || !s) return false;
+  let u;
+  try { u = new URL(s); } catch (e) { return false; }
+  return u.protocol === 'http:' || u.protocol === 'https:';
 }
 </script>
 </body>
