@@ -2377,8 +2377,8 @@ function getCodecWorker() {
       cb(e.data.result);
     };
     wk.onerror = () => {
-      // Blob workers are refused under file:// and some strict CSPs; fall back
-      // to decoding inline rather than losing the feature entirely.
+      // Some strict CSPs and some browsers' file:// refuse blob workers; fall
+      // back to decoding inline rather than losing the feature entirely.
       codecWorkerDead = true;
       codecWorker = null;
       wk.terminate();
