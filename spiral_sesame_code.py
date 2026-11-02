@@ -424,9 +424,13 @@ class SpiralSesameDecoder:
         self.seed = seed
         self.rs = ReedSolomon(nsym=ec_level)
         self.whitening = whitening_sequence(N_TOTAL_LOGICAL)
+        self._grid_cache = None
+        self._centers = None
+        self._interleaver = None
+        self._repeat_groups = None
 
-    def decode_image(self, img: Image.Image) -> Optional[str]:
-        result = self.decode_bytes(img)
+    def decode_image(self, img: Image.Image, try_hard=True) -> Optional[str]:
+        result = self.decode_bytes(img, try_hard=try_hard)
         if result is None:
             return None
         try:
@@ -434,9 +438,25 @@ class SpiralSesameDecoder:
         except UnicodeDecodeError:
             return result.hex()
 
-    def decode_bytes(self, img: Image.Image) -> Optional[bytes]:
+    def decode_bytes(self, img: Image.Image, try_hard=True) -> Optional[bytes]:
         img = img.convert('RGB')
         arr = np.array(img)
+
+        deferred = []
+        for raw in self._pose_candidates(arr):
+            result = self._backend(raw, False)
+            if result is not None:
+                return result
+            # The exhaustive backend sweeps every plausible payload length,
+            # so it costs seconds per candidate. Only the best-ranked poses
+            # are worth that; the rest are geometry the cheap pass already
+            # rejected by a wide margin.
+            if try_hard and len(deferred) < 4:
+                deferred.append(raw)
+        for raw in deferred:
+            result = self._backend(raw, True)
+            if result is not None:
+                return result
 
         circle = self._detect_bagel_circle(arr)
         if circle is None:
@@ -465,40 +485,817 @@ class SpiralSesameDecoder:
 
         damage = self._border_white_mask(narr)
 
-        grid = build_polar_grid(canon_cx, canon_cy,
-                                canon_inner_r + 4, canon_outer_r - 4,
-                                SESAME_SPACING,
-                                fixed_count=CANONICAL_GRID_COUNT)
+        grid = self._grid()
 
         raw_values = self._read_presence(narr, grid, damage)
+        return self._backend(raw_values, try_hard)
 
-        interleaver = SectorInterleaver(grid, N_PHYSICAL, REPEAT, seed=self.seed)
-        ordered = interleaver.deinterleave_with_erasures(raw_values[:N_PHYSICAL])
+    def _backend(self, raw_values, try_hard=True):
+        """Deinterleave -> majority vote -> de-whiten -> RS. Shared by both
+        front ends so they can be tried in sequence."""
+        inter = self._interleave_obj()
+        src = np.empty(N_PHYSICAL, dtype=np.int8)
+        src[:] = -1
+        n = min(N_PHYSICAL, len(raw_values))
+        for i in range(n):
+            v = raw_values[i]
+            if v is not None:
+                src[i] = v
+        ordered = np.full(N_PHYSICAL, -1, dtype=np.int8)
+        ordered[inter.physical_to_logical[:n]] = src[:n]
 
-        # Majority vote per REPEAT group, then de-whiten.
-        # Fully-erased groups take the whitening bit and are flagged so
-        # Reed-Solomon can use erasure decoding (double correction power).
-        logical = []
-        logical_erased = []
-        for g in range(N_TOTAL_LOGICAL):
-            group = ordered[g * REPEAT:(g + 1) * REPEAT]
-            ones = sum(1 for v in group if v == 1)
-            zeros = sum(1 for v in group if v == 0)
-            nones = sum(1 for v in group if v is None)
-            if ones > zeros:
-                b = 1
-            elif zeros > ones:
-                b = 0
-            else:
-                b = self.whitening[g]
-            logical.append(b ^ self.whitening[g])
-            logical_erased.append(nones >= 3)
+        groups = ordered.reshape(N_TOTAL_LOGICAL, REPEAT).astype(np.int16)
+        ones = (groups == 1).sum(axis=1)
+        zeros = (groups == 0).sum(axis=1)
+        nones = (groups < 0).sum(axis=1)
+        whit = np.fromiter(self.whitening, dtype=np.int16, count=N_TOTAL_LOGICAL)
+        b = np.where(ones > zeros, 1, np.where(zeros > ones, 0, whit))
+        logical = (b ^ whit).tolist()
+        logical_erased = (nones >= 3).tolist()
 
         result = self._extract_payload(logical, logical_erased)
         if result is not None:
             return result
-        return self._decode_exhaustive(logical, logical_erased)
+        if try_hard:
+            return self._decode_exhaustive(logical, logical_erased)
+        return None
 
+    # ─── Camera-robust front end ────────────────────────────────────────
+    #
+    # A phone photo differs from a rendered PNG in four ways: the bagel is
+    # off-center and small, the view is tilted (circle -> ellipse plus
+    # keystone), the in-plane rotation is unknown (the grid has no angular
+    # anchor), and illumination is arbitrary. So instead of fixed brightness
+    # thresholds this path works on a morphological white top-hat response,
+    # which is invariant to smooth lighting and rejects background texture,
+    # and fits the full pose: center, scale, aspect, tilt axis, rotation,
+    # keystone. Geometry comes from the rim conic of the seed disc; rotation
+    # comes from REPEAT-copy agreement (_align_score), because no scoring
+    # function based on the samples alone can tell a rotation from an alias
+    # of it.
+
+    ANALYZE_MAX_DIM = 560
+    R0 = 467.0
+
+    def _grid(self):
+        if self._grid_cache is None:
+            canon_outer_r, canon_inner_r = get_ring_params(
+                (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
+            self._grid_cache = build_polar_grid(
+                DEFAULT_IMAGE_SIZE // 2, DEFAULT_IMAGE_SIZE // 2,
+                canon_inner_r + 4, canon_outer_r - 4, SESAME_SPACING,
+                fixed_count=CANONICAL_GRID_COUNT)
+        return self._grid_cache
+
+    def _interleave_obj(self):
+        if self._interleaver is None:
+            self._interleaver = SectorInterleaver(
+                self._grid(), N_PHYSICAL, REPEAT, seed=self.seed)
+        return self._interleaver
+
+    def _cell_centers(self):
+        if self._centers is None:
+            grid = self._grid()
+            c = DEFAULT_IMAGE_SIZE / 2.0
+            self._centers = np.array(
+                [[grid[i][0] - c, grid[i][1] - c] for i in range(N_PHYSICAL)],
+                dtype=np.float64)
+        return self._centers
+
+    @staticmethod
+    def _box_blur(a, rad):
+        if rad <= 0:
+            return np.asarray(a, dtype=np.float64)
+        a = np.asarray(a, dtype=np.float64)
+        h, w = a.shape
+        c = np.zeros((h + 1, w + 1), dtype=np.float64)
+        c[1:, 1:] = np.cumsum(np.cumsum(a, axis=0), axis=1)
+        ys = np.arange(h)
+        xs = np.arange(w)
+        y0 = np.clip(ys - rad, 0, h)
+        y1 = np.clip(ys + rad + 1, 0, h)
+        x0 = np.clip(xs - rad, 0, w)
+        x1 = np.clip(xs + rad + 1, 0, w)
+        s = (c[np.ix_(y1, x1)] - c[np.ix_(y0, x1)]
+             - c[np.ix_(y1, x0)] + c[np.ix_(y0, x0)])
+        n = (y1 - y0)[:, None] * (x1 - x0)[None, :]
+        return s / np.maximum(n, 1)
+
+    @staticmethod
+    def _mov_extreme(a, k, want_min):
+        if k <= 1:
+            return np.asarray(a, dtype=np.float64)
+        k |= 1
+        pad = k // 2
+        b = np.pad(a, ((pad, pad), (pad, pad)), mode='edge')
+        fn = np.minimum if want_min else np.maximum
+        h, w = a.shape
+        m = b[:h, :].copy()
+        for i in range(1, k):
+            m = fn(m, b[i:i + h, :])
+        out = m[:, :w].copy()
+        for j in range(1, k):
+            out = fn(out, m[:, j:j + w])
+        return out
+
+    def _tophat(self, a, k):
+        """White top-hat (image minus its morphological opening): keeps bright
+        blobs smaller than k and cancels broad shading and background texture,
+        which a plain high-pass would leave competing with the seeds."""
+        a = np.asarray(a, dtype=np.float64)
+        if k <= 1:
+            return a - self._box_blur(a, 8)
+        opened = self._mov_extreme(self._mov_extreme(a, k, True), k, False)
+        return a - opened
+
+    def _project(self, prm, pts):
+        """Canonical cell coords -> image coords under the fitted pose."""
+        cp = math.cos(prm['phi'])
+        sp = math.sin(prm['phi'])
+        px = pts[:, 0]
+        py = pts[:, 1]
+        qx = px * cp - py * sp
+        qy = px * sp + py * cp
+        d = 1.0 + (prm['kx'] * qx + prm['ky'] * qy) / self.R0
+        d = np.clip(d, 0.35, 2.5)
+        qx = qx / d
+        qy = qy / d
+        ct = math.cos(prm['theta'])
+        st = math.sin(prm['theta'])
+        u = qx * ct - qy * st
+        v = (qx * st + qy * ct) * prm['aspect']
+        x = u * ct + v * st
+        y = -u * st + v * ct
+        return prm['cx'] + x * prm['scale'], prm['cy'] + y * prm['scale']
+
+    def _sample_cells(self, img, prm, step=1):
+        h, w = img.shape
+        pts = self._cell_centers()[::step]
+        xs, ys = self._project(prm, pts)
+        x0 = np.floor(xs)
+        y0 = np.floor(ys)
+        fx = xs - x0
+        fy = ys - y0
+        xi = x0.astype(np.int64)
+        yi = y0.astype(np.int64)
+        valid = (xi >= 0) & (xi < w - 1) & (yi >= 0) & (yi < h - 1)
+        xi = np.clip(xi, 0, max(w - 2, 0))
+        yi = np.clip(yi, 0, max(h - 2, 0))
+        a = img[yi, xi]
+        b = img[yi, xi + 1]
+        c = img[yi + 1, xi]
+        d = img[yi + 1, xi + 1]
+        val = (a * (1 - fx) * (1 - fy) + b * fx * (1 - fy)
+               + c * (1 - fx) * fy + d * fx * fy)
+        return np.where(valid, val, np.nan), xs, ys, valid
+
+    @staticmethod
+    def _otsu(v, bins=64):
+        """Threshold maximizing between-class variance, plus the normalized
+        separability (0..0.25) used as the pose-alignment score."""
+        v = v[np.isfinite(v)]
+        if v.size < 64:
+            return None, -1.0
+        lo = float(v.min())
+        hi = float(v.max())
+        if hi - lo < 1e-9:
+            return lo, -1.0
+        hist, edges = np.histogram(v, bins=bins, range=(lo, hi))
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        total = float(hist.sum())
+        wt = hist / total
+        mu = float((wt * centers).sum())
+        best_eta = -1.0
+        best_t = centers[0]
+        w0 = 0.0
+        mu0 = 0.0
+        for i in range(bins):
+            w0 += wt[i]
+            mu0 += wt[i] * centers[i]
+            if w0 <= 1e-6 or w0 >= 1 - 1e-6:
+                continue
+            m0 = mu0 / w0
+            m1 = (mu - mu0) / (1 - w0)
+            eta = w0 * (1 - w0) * (m0 - m1) ** 2
+            if eta > best_eta:
+                best_eta = eta
+                best_t = centers[i]
+        var = float(v.var())
+        return float(best_t), (best_eta / var if var > 1e-12 else -1.0)
+
+    def _copies(self):
+        """Physical indices of the REPEAT copies of every logical bit."""
+        if self._repeat_groups is None:
+            self._repeat_groups = np.array(
+                self._interleave_obj().logical_to_physical,
+                dtype=np.int64).reshape(N_TOTAL_LOGICAL, REPEAT)
+        return self._repeat_groups
+
+    def _align_score(self, img, prm):
+        """Fraction of logical bits whose REPEAT copies all read the same.
+
+        Sample bimodality cannot see the absolute rotation: turning the grid
+        slides each ring tangentially, so every cell still lands on either a
+        seed or bare dough and the samples stay just as bimodal -- an aliased
+        rotation can even out-score the true one. The copies of a logical bit
+        sit in different sectors, so a rotation shifts each of them by a
+        different number of cells and their agreement collapses. That makes
+        this the score that actually pins the rotation, and it is sharper than
+        bimodality on the rest of the pose too.
+        """
+        vals, _, _, valid = self._sample_cells(img, prm)
+        thr, _ = self._otsu(vals)
+        if thr is None:
+            return -1.0
+        bits = np.where(valid, (vals > thr).astype(np.float64), np.nan)
+        g = bits[self._copies()]
+        g = g[np.all(np.isfinite(g), axis=1)]
+        if g.shape[0] < 64:
+            return -1.0
+        return float(np.mean(g.max(axis=1) == g.min(axis=1)))
+
+    @staticmethod
+    def _row_detrend(a, rad):
+        n = a.shape[1]
+        c = np.zeros((a.shape[0], n + 1), dtype=np.float64)
+        c[:, 1:] = np.cumsum(a, axis=1)
+        i = np.arange(n)
+        i0 = np.clip(i - rad, 0, n)
+        i1 = np.clip(i + rad + 1, 0, n)
+        s = c[:, i1] - c[:, i0]
+        return a - s / np.maximum(i1 - i0, 1)
+
+    def _localize(self, resp):
+        """Find the seed disc in the top-hat energy map: its centroid is the
+        code center, its RMS radius the scale, and its inertia the tilt axis
+        and aspect. Brightness, shading and background texture are already
+        gone from `resp`, so the disc is the only large structure left."""
+        h, w = resp.shape
+        rad = max(3, int(round(min(h, w) / 90.0)))
+        e = self._box_blur(resp * resp, rad)
+        inside = e > 0.25 * float(e.max())
+        outside = ~inside
+        if int(inside.sum()) < 300 or not bool(outside.any()):
+            return None, -1.0
+        contrast = float(e[inside].mean()) / (float(e[outside].mean()) + 1e-9)
+        if contrast < 2.5:
+            return None, -1.0
+        ys, xs = np.nonzero(inside)
+        wts = e[inside]
+        cx = float(xs.mean())
+        cy = float(ys.mean())
+        rms = math.sqrt(float(((xs - cx) ** 2 + (ys - cy) ** 2).mean()))
+        keep = np.ones_like(xs, dtype=bool)
+        for _ in range(3):
+            # Re-center on the disc alone: background speckle that survived
+            # the threshold would otherwise drag the centroid several pixels,
+            # which is enough to flatten the scale landscape later on.
+            keep = ((xs - cx) ** 2 + (ys - cy) ** 2) <= (1.5 * rms) ** 2
+            if int(keep.sum()) < 300:
+                return None, -1.0
+            xk, yk, wk = xs[keep], ys[keep], wts[keep]
+            sv = float(wk.sum())
+            cx = float((xk * wk).sum() / sv)
+            cy = float((yk * wk).sum() / sv)
+            rms = math.sqrt(float(((xk - cx) ** 2 + (yk - cy) ** 2).mean()))
+        xk, yk, wk = xs[keep], ys[keep], wts[keep]
+        sv = float(wk.sum())
+        dx = xk - cx
+        dy = yk - cy
+        mu20 = float((wk * dx * dx).sum() / sv)
+        mu02 = float((wk * dy * dy).sum() / sv)
+        mu11 = float((wk * dx * dy).sum() / sv)
+        tr = mu20 + mu02
+        det = mu20 * mu02 - mu11 * mu11
+        disc = max(tr * tr / 4.0 - det, 0.0)
+        l1 = tr / 2.0 + math.sqrt(disc)
+        l2 = max(tr / 2.0 - math.sqrt(disc), 1e-9)
+        outer_r, inner_r = get_ring_params(
+            (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
+        # Area-uniform annulus between inner_r and outer_r: E[r^2]=(R^2+r0^2)/2
+        rms_norm = math.sqrt((outer_r ** 2 + inner_r ** 2) / 2.0)
+        scale = math.sqrt(max(tr, 1e-9)) / rms_norm
+        if scale <= 1e-6:
+            return None, -1.0
+        aspect = math.sqrt(l2 / l1)
+        theta = 0.5 * math.atan2(2 * mu11, mu20 - mu02)
+        r_guess = scale * float(outer_r)
+        # The edge conic wants an unsmoothed energy map: the box blur that
+        # steadies the centroid pushes the steepest-descent edge outward by
+        # roughly two thirds of its radius, which is a 2-4% scale error on a
+        # small bagel and far outside the alignment capture basin.
+        e_edge = self._box_blur(resp * resp, max(1, int(round(min(h, w) / 280.0))))
+        outer_c = self._edge_conic(e_edge, cx, cy, 0.60 * r_guess,
+                                   1.40 * r_guess, True)
+        hole_c = self._edge_conic(e_edge, cx, cy, 0.15 * r_guess,
+                                  0.55 * r_guess, False)
+        if outer_c is not None:
+            rcx, rcy, rmaj, rasp, rpsi = outer_c
+            r_scale = rmaj / 468.0
+            if 0.6 * scale < r_scale < 1.4 * scale:
+                cx, cy, scale, aspect, theta = rcx, rcy, r_scale, rasp, rpsi
+            kx = ky = 0.0
+            if aspect < 0.985:
+                # Only worth the full pose fit under real tilt: the projected
+                # grid center stops coinciding with the rim ellipse's center,
+                # and the keystone terms are the only thing that can absorb
+                # the gap. Frontal shots are better served by the rim conic
+                # alone -- the hole conic is small and its edge sits several
+                # pixels outside the true hole, so pulling it into the fit
+                # inflates the scale past the alignment basin.
+                pose = self._fit_pose_conics(
+                    outer_c, hole_c,
+                    {'cx': cx, 'cy': cy, 'scale': scale, 'aspect': aspect,
+                     'theta': theta, 'phi': 0.0, 'kx': 0.0, 'ky': 0.0})
+                cx, cy, scale = pose['cx'], pose['cy'], pose['scale']
+                aspect, theta = pose['aspect'], pose['theta']
+                kx, ky = pose['kx'], pose['ky']
+        else:
+            kx, ky = 0.0, 0.0
+        if aspect > 0.985:
+            # Tilt below ~17 degrees is not worth modelling, and any residual
+            # squeeze at that level is fit noise: a 1% squeeze along a random
+            # axis costs more alignment than it explains.
+            aspect, theta = 1.0, 0.0
+        return {'cx': cx, 'cy': cy, 'scale': scale,
+                'aspect': min(max(aspect, 0.3), 1.0),
+                'theta': theta, 'phi': 0.0, 'kx': kx, 'ky': ky}, contrast
+
+    def _edge_conic(self, e, cx, cy, r_lo, r_hi, descent=True):
+        """Conic through the steepest radial transition of the seed energy
+        between r_lo and r_hi, taken per angle bin: descent finds the outer
+        rim, ascent the hole edge."""
+        h, w = e.shape
+        yy, xx = np.mgrid[0:h, 0:w]
+        dx = xx - cx
+        dy = yy - cy
+        r = np.hypot(dx, dy)
+        ang = np.arctan2(dy, dx)
+        nb, nsh = 360, 64
+        span = r_hi - r_lo
+        if span <= 1.0:
+            return None
+        sh = ((r - r_lo) / span * nsh).astype(np.int64)
+        ok = (sh >= 0) & (sh < nsh)
+        bi = np.clip(((ang[ok] + math.pi) / (2 * math.pi) * nb).astype(np.int64),
+                     0, nb - 1)
+        flat = bi * nsh + sh[ok]
+        S = np.bincount(flat, weights=e[ok].ravel(),
+                        minlength=nb * nsh).reshape(nb, nsh)
+        C = np.bincount(flat, minlength=nb * nsh).reshape(nb, nsh)
+        P = S / np.maximum(C, 1.0)
+        # Normalise each angle bin by its own peak: under tilt the far side is
+        # compressed and its gradient is proportionally shallower.
+        P = P / np.maximum(P.max(axis=1, keepdims=True), 1e-9)
+        kern = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+        kern /= kern.sum()
+        Ps = np.stack([np.convolve(row, kern, mode='same') for row in P])
+        dP = Ps[:, 1:] - Ps[:, :-1]
+        j = np.argmin(dP, axis=1) if descent else np.argmax(dP, axis=1)
+        depth = np.abs(dP[np.arange(nb), j])
+        good = depth > 0.20 * float(np.percentile(depth, 70))
+        if int(good.sum()) < 200:
+            return None
+        if len(np.unique(np.arange(nb)[good] // 30)) < 10:
+            return None
+        jl = np.clip(j - 1, 0, nsh - 2)
+        jh = np.clip(j + 1, 0, nsh - 2)
+        d0 = dP[np.arange(nb), jl]
+        d1 = dP[np.arange(nb), j]
+        d2 = dP[np.arange(nb), jh]
+        denom = d0 - 2 * d1 + d2
+        sub = np.where(np.abs(denom) > 1e-9,
+                       0.5 * (d0 - d2) / np.where(np.abs(denom) > 1e-9,
+                                                  denom, 1.0), 0.0)
+        sub = np.clip(sub, -1.0, 1.0)
+        r_edge = r_lo + span * (j + 0.5 + sub) / nsh
+        theta_b = (np.arange(nb) + 0.5) / nb * 2 * math.pi - math.pi
+        x = cx + r_edge * np.cos(theta_b)
+        y = cy + r_edge * np.sin(theta_b)
+        return self._conic_fit(x[good], y[good])
+
+    @staticmethod
+    def _conic_fit(x, y):
+        """Algebraic ellipse fit with 2.5-sigma clipping, returned as
+        (cx, cy, semi-major, aspect, major-axis angle)."""
+        cx = cy = 0.0
+        for _ in range(3):
+            if x.size < 24:
+                return None
+            A = np.stack([x * x, x * y, y * y, x, y], axis=1)
+            sol = np.linalg.lstsq(A, -np.ones_like(x), rcond=None)[0]
+            a, b, c, d, f = sol
+            m = np.array([[a, b / 2.0], [b / 2.0, c]])
+            try:
+                cen = np.linalg.solve(2.0 * m, [-d, -f])
+            except np.linalg.LinAlgError:
+                return None
+            val = (cen @ m @ cen) + d * cen[0] + f * cen[1] + 1.0
+            if val >= -1e-9:
+                return None
+            ev, evec = np.linalg.eigh(m / -val)
+            if ev[0] <= 1e-12:
+                return None
+            ax = 1.0 / np.sqrt(ev)
+            major = int(np.argmax(ax))
+            cx, cy = float(cen[0]), float(cen[1])
+            psi = float(math.atan2(evec[1, major], evec[0, major]))
+            a_maj = float(ax[major])
+            asp = float(ax[1 - major] / ax[major])
+            tt = np.arctan2(y - cy, x - cx)
+            r_mod = 1.0 / np.sqrt(np.cos(tt - psi) ** 2 / a_maj ** 2
+                                  + np.sin(tt - psi) ** 2
+                                  / max(a_maj * asp, 1e-9) ** 2)
+            resid = np.abs(np.hypot(x - cx, y - cy) - r_mod)
+            keep = resid < max(2.5 * float(resid.std()), 1.5)
+            if int(keep.sum()) < 24:
+                break
+            x, y = x[keep], y[keep]
+        if x.size < 24:
+            return None
+        return cx, cy, a_maj, min(max(asp, 0.3), 1.0), psi
+
+    def _conic_of_circle(self, prm, radius):
+        t = np.linspace(0.0, 2 * math.pi, 90, endpoint=False)
+        pts = np.stack([radius * np.cos(t), radius * np.sin(t)], axis=1)
+        x, y = self._project(prm, pts)
+        return self._conic_fit(x, y)
+
+    def _fit_pose_conics(self, outer, hole, prm):
+        """Two concentric canonical circles (seed rim, hole edge) project to
+        the two observed conics. Matching them recovers center, scale, tilt
+        and keystone together, including the perspective offset between a
+        conic's center and the projected grid center, which is exactly what
+        makes a rim-only estimate drift under tilt."""
+        targets = []
+        if outer is not None:
+            targets.append((468.0, outer))
+        if hole is not None:
+            targets.append((165.0, hole))
+        if not targets:
+            return prm
+        best = dict(prm)
+
+        def cost(p):
+            tot = 0.0
+            for radius, obs in targets:
+                c = self._conic_of_circle(p, radius)
+                if c is None:
+                    return 1e6
+                pcx, pcy, pa, pasp, ppsi = c
+                ocx, ocy, oa, oasp, opsi = obs
+                tot += ((pcx - ocx) ** 2 + (pcy - ocy) ** 2) / 4.0
+                tot += ((pa - oa) / 3.0) ** 2
+                # A near-circular conic carries no axis information, and the
+                # small hole conic is too noisy for it: take squeeze and its
+                # direction only from a clearly eccentric outer rim.
+                w = 0.0 if radius < 300.0 else min(max((1.0 - oasp) / 0.05,
+                                                       0.0), 1.0)
+                tot += w * ((pasp - oasp) / 0.01) ** 2
+                dpsi = (ppsi - opsi + math.pi / 2) % math.pi - math.pi / 2
+                tot += w * (dpsi / 0.05) ** 2
+            return tot
+
+        c0 = cost(best)
+        keys = ('cx', 'cy', 'scale', 'aspect', 'theta', 'kx', 'ky')
+        x0 = [best[k] for k in keys]
+        steps = [4.0, 4.0, 0.02 * best['scale'], 0.03, 0.08, 0.10, 0.10]
+
+        def fvec(v):
+            p = dict(best)
+            p.update(zip(keys, v))
+            p['aspect'] = min(max(p['aspect'], 0.3), 1.0)
+            return cost(p)
+
+        # Nelder-Mead: keystone and center trade off against each other, a
+        # valley coordinate descent cannot follow.
+        sim = [np.array(x0, dtype=np.float64)]
+        for i in range(len(keys)):
+            v = np.array(x0, dtype=np.float64)
+            v[i] += steps[i]
+            sim.append(v)
+        fv = [fvec(v) for v in sim]
+        for _ in range(160):
+            order = np.argsort(fv)
+            sim = [sim[i] for i in order]
+            fv = [fv[i] for i in order]
+            if fv[-1] - fv[0] < 1e-7:
+                break
+            cen = np.mean(sim[:-1], axis=0)
+            xr = cen + (cen - sim[-1])
+            fr = fvec(xr)
+            if fr < fv[0]:
+                xe = cen + 2.0 * (cen - sim[-1])
+                fe = fvec(xe)
+                if fe < fr:
+                    sim[-1], fv[-1] = xe, fe
+                else:
+                    sim[-1], fv[-1] = xr, fr
+            elif fr < fv[-2]:
+                sim[-1], fv[-1] = xr, fr
+            else:
+                xc = cen + 0.5 * (sim[-1] - cen)
+                fc = fvec(xc)
+                if fc < fv[-1]:
+                    sim[-1], fv[-1] = xc, fc
+                else:
+                    for i in range(1, len(keys) + 1):
+                        sim[i] = sim[0] + 0.5 * (sim[i] - sim[0])
+                        fv[i] = fvec(sim[i])
+        order = np.argsort(fv)
+        xb = sim[order[0]]
+        best.update(zip(keys, xb))
+        best['aspect'] = min(max(best['aspect'], 0.3), 1.0)
+        return best
+
+    # Copy agreement dies outside roughly +-3 px of center and +-1% of scale,
+    # but a bagel pushed toward the frame edge localizes 15 px out, so the
+    # rounds start wide and narrow from there.
+    COARSE_ROUNDS = [
+        (8.0, 4.0, 0.06),
+        (4.0, 2.0, 0.04),
+        (2.0, 1.0, 0.02),
+        (1.0, 0.5, 0.01),
+        (0.5, 0.25, 0.004),
+    ]
+
+    def _coarse_pose(self, resp_s, prm, k_phi=3):
+        """Snap the disc-moment pose onto the alignment optimum.
+
+        Center and scale are searched jointly on a grid rather than one axis
+        at a time, because at this resolution a center error can only be paid
+        for by a scale error and vice versa.
+
+        Rotation and geometry have to be ordered, and which order works
+        depends on which of the two the localization got wrong:
+
+        * Shot straight on, the center lands within a pixel or two, so the
+          rotation scan is already meaningful and picks up the roll at once.
+        * Pushed toward the frame edge, the center lands several pixels out,
+          and then the rotation scan is worse than useless: a couple of pixels
+          of center error already moves the agreement argmax tens of degrees,
+          so it locks onto an alias and the geometry search that follows has
+          no basin left to find.
+
+        So scan rotation first, and only when that lands somewhere poor fall
+        back to fixing the geometry at the incoming rotation and scanning
+        rotation afterwards.
+        """
+        s0 = float(prm['scale'])
+
+        def try_set(base, **kw):
+            p = dict(base)
+            p.update(kw)
+            p['aspect'] = min(max(p['aspect'], 0.3), 1.0)
+            # The ring grid is radially self-similar, so half/double scale
+            # also lands on seeds; the disc radius from _localize rules
+            # those harmonics out.
+            p['scale'] = min(max(p['scale'], 0.85 * s0), 1.18 * s0)
+            return p, self._align_score(resp_s, p)
+
+        def geom_rounds(best, score):
+            for i, (crange, cstep, srange) in enumerate(self.COARSE_ROUNDS):
+                offs = np.arange(-crange, crange + 1e-9, cstep)
+                for dx in offs:
+                    for dy in offs:
+                        p, s = try_set(best, cx=best['cx'] + float(dx),
+                                       cy=best['cy'] + float(dy))
+                        if s > score:
+                            score, best = s, p
+                for ms in np.linspace(1.0 - srange, 1.0 + srange, 9):
+                    p, s = try_set(best, scale=best['scale'] * float(ms))
+                    if s > score:
+                        score, best = s, p
+                if i == 1:
+                    # Aspect and its axis are coupled: a compression along the
+                    # wrong axis scores worse than none at all. Swept once the
+                    # widest center round has landed, not before -- at a bad
+                    # center a squeeze can only compensate for the offset and
+                    # the pair then locks together.
+                    for asp in (0.70, 0.80, 0.88, 0.94, 1.0):
+                        for th in np.arange(0.0, math.pi, math.pi / 8.0):
+                            p, s = try_set(best, aspect=asp, theta=float(th))
+                            if s > score:
+                                score, best = s, p
+            return best, score
+
+        def rotate_then_geom(start):
+            best = dict(start)
+            score = self._align_score(resp_s, best)
+            for _, cand in self._phi_peaks(resp_s, best, 1.0, 0.25,
+                                           k_phi, 20.0):
+                b, s = geom_rounds(dict(cand), self._align_score(resp_s, cand))
+                if s > score:
+                    best, score = b, s
+            return best, score
+
+        out_best, out_score = rotate_then_geom(prm)
+        if out_score < 0.8:
+            geom_first, g_score = geom_rounds(dict(prm),
+                                              self._align_score(resp_s, prm))
+            alt, alt_score = rotate_then_geom(geom_first)
+            if g_score > alt_score:
+                alt, alt_score = geom_first, g_score
+            if alt_score > out_score:
+                out_best, out_score = alt, alt_score
+        return out_best, out_score
+
+    # Step sizes stay inside the measured tolerances: scale +-0.5%, center
+    # +-1.5px, aspect +-0.01, keystone +-0.03, rotation +-0.3 deg. Coarser
+    # sweeps drift past the optimum because the alignment score is flat and
+    # noisy at that resolution.
+    DESCENT_ROUNDS = [
+        [('scale', np.linspace(0.994, 1.006, 9), True),
+         ('cx', np.arange(-1.5, 1.51, 0.5), False),
+         ('cy', np.arange(-1.5, 1.51, 0.5), False),
+         ('aspect', np.arange(-0.012, 0.0121, 0.003), False),
+         ('theta', np.arange(-0.024, 0.0241, 0.006), False),
+         ('kx', np.arange(-0.06, 0.061, 0.015), False),
+         ('ky', np.arange(-0.06, 0.061, 0.015), False)],
+        [('scale', np.linspace(0.9985, 1.0015, 7), True),
+         ('cx', np.arange(-0.4, 0.41, 0.2), False),
+         ('cy', np.arange(-0.4, 0.41, 0.2), False),
+         ('aspect', np.arange(-0.004, 0.0041, 0.001), False),
+         ('theta', np.arange(-0.008, 0.0081, 0.002), False),
+         ('kx', np.arange(-0.02, 0.021, 0.005), False),
+         ('ky', np.arange(-0.02, 0.021, 0.005), False)],
+    ]
+
+    # Residual geometry error the descent can still leave behind; the real
+    # decoder arbitrates over these variants.
+    GEOM_VARIANTS = [
+        {},
+        {'scale': 1.0025}, {'scale': 0.9975},
+        {'cx': 0.6}, {'cx': -0.6}, {'cy': 0.6}, {'cy': -0.6},
+        {'aspect': 0.004}, {'aspect': -0.004},
+        {'kx': 0.02}, {'ky': 0.02}, {'kx': -0.02}, {'ky': -0.02},
+    ]
+
+    def _descend(self, resp_s, prm, score):
+        for spec in self.DESCENT_ROUNDS:
+            for key, deltas, mult in spec:
+                for dv in deltas:
+                    p = dict(prm)
+                    p[key] = (prm[key] * float(dv) if mult
+                              else prm[key] + float(dv))
+                    if key == 'aspect':
+                        p[key] = min(max(p[key], 0.3), 1.0)
+                    e = self._align_score(resp_s, p)
+                    if e > score:
+                        score = e
+                        prm = p
+        return prm, score
+
+    def _phi_scan(self, resp_s, prm, deg_step):
+        out = []
+        for deg in np.arange(0.0, 360.0, deg_step):
+            p = dict(prm)
+            p['phi'] = math.radians(float(deg))
+            out.append((self._align_score(resp_s, p), float(deg)))
+        out.sort(key=lambda item: -item[0])
+        return out
+
+    def _phi_peaks(self, resp_s, prm, deg_step, fine_step, k_peaks, sep_deg):
+        peaks = []
+        chosen = []
+        for score, deg in self._phi_scan(resp_s, prm, deg_step):
+            if any(min(abs(deg - o), 360 - abs(deg - o)) < sep_deg
+                   for o in chosen):
+                continue
+            local = [(score, deg)]
+            for d2 in np.arange(deg - deg_step, deg + deg_step + 1e-9,
+                                fine_step):
+                p = dict(prm)
+                p['phi'] = math.radians(float(d2) % 360.0)
+                local.append((self._align_score(resp_s, p), float(d2) % 360.0))
+            local.sort(key=lambda item: -item[0])
+            score_b, deg_b = local[0]
+            p = dict(prm)
+            p['phi'] = math.radians(deg_b)
+            peaks.append((score_b, p))
+            chosen.append(deg_b)
+            if len(peaks) >= k_peaks:
+                break
+        peaks.sort(key=lambda item: -item[0])
+        return peaks
+
+    def _refine_pose(self, resp_s, prm, k_peaks=3):
+        """Find the in-plane rotation, then tighten the rest of the pose.
+
+        `_coarse_pose` has already put the center and scale inside the
+        agreement basin, so the rotation scan is now meaningful: it runs at
+        1 deg, coarse enough to bracket the peak since agreement is already
+        down to ~0.5 half a degree out, and only then is the geometry
+        descended and the rotation rescanned at 0.1 deg. The top peaks are
+        all returned, ranked, for the real decoder to arbitrate.
+        """
+        out = []
+        for score, p in self._phi_peaks(resp_s, prm, 1.0, 0.1, k_peaks, 3.0):
+            refined, s = self._descend(resp_s, p, score)
+            fine = [(s, refined)]
+            lo = refined['phi'] - math.radians(0.5)
+            for d2 in np.arange(lo, lo + math.radians(1.0) + 1e-12,
+                                math.radians(0.05)):
+                q = dict(refined)
+                q['phi'] = float(d2)
+                fine.append((self._align_score(resp_s, q), q))
+            fine.sort(key=lambda item: -item[0])
+            out.extend(fine[:2])
+        out.sort(key=lambda item: -item[0])
+        return out[0][1], out
+
+    def _classify(self, vals, valid, hit):
+        thresh = self._otsu(vals)[0]
+        if thresh is None:
+            return None
+        fin = np.isfinite(vals)
+        below = vals[fin & (vals < thresh)]
+        above = vals[fin & (vals >= thresh)]
+        if below.size < 100 or above.size < 100:
+            return None
+        m0 = float(np.median(below))
+        m1 = float(np.median(above))
+        gap = abs(m1 - m0)
+        if gap <= 1e-6:
+            return None
+        # Erasure band from each mode's own spread (MAD), not from the gap.
+        # A gap-proportional band eats the whole tail of the broader mode and
+        # skews the vote; MAD scales with the actual noise instead, so a
+        # blurry low-contrast shot widens it (more erasures for RS to use)
+        # while a clean one keeps almost every cell decisive.
+        s0 = float(np.median(np.abs(below - m0)))
+        s1 = float(np.median(np.abs(above - m1)))
+        floor = 0.05 * gap
+        lo_cut = thresh - max(1.3 * s0, floor)
+        hi_cut = thresh + max(1.3 * s1, floor)
+
+        out_arr = np.empty(N_PHYSICAL, dtype=object)
+        out_arr[:] = None
+        usable = valid & (~hit)
+        out_arr[usable & (vals > hi_cut)] = 1
+        out_arr[usable & (vals < lo_cut)] = 0
+        return out_arr.tolist()
+
+    def _pose_candidates(self, arr):
+        """Camera-robust front end. Yields cell readings for ranked pose
+        candidates; the caller decodes them in order and stops at the first
+        payload whose header and SHA-256 check out."""
+        gray = np.mean(arr.astype(np.float64), axis=2)
+        h, w = gray.shape
+        if min(h, w) < 40:
+            return
+
+        f = self.ANALYZE_MAX_DIM / float(max(h, w))
+        if f < 1.0:
+            resized = Image.fromarray(gray.astype(np.uint8)).resize(
+                (max(8, int(round(w * f))), max(8, int(round(h * f)))),
+                Image.BOX)
+            a_gray = np.array(resized).astype(np.float64)
+        else:
+            f = 1.0
+            a_gray = gray
+
+        a_resp = self._tophat(a_gray, 5)
+        prm, loc_score = self._localize(a_resp)
+        if prm is None:
+            print(f"[decode] pose: localization failed (score={loc_score:.3f})")
+            return
+        prm['cx'] /= f
+        prm['cy'] /= f
+        prm['scale'] /= f
+
+        th_k = max(3, int(round(12.0 * prm['scale'])))
+        resp = self._tophat(gray, th_k)
+        # A quarter of the cell pitch: enough to average out grain inside a
+        # cell, and it truncates to zero once cells are only a few pixels
+        # across, where any blur at all smears seeds into their neighbours.
+        sm_rad = int(min(2.25 * prm['scale'], 28.0))
+        resp_s = self._box_blur(resp, sm_rad)
+
+        prm, _ = self._coarse_pose(resp_s, prm)
+        _, peaks = self._refine_pose(resp_s, prm)
+
+        dmg_rad = max(2, int(round(3.0 * prm['scale'])))
+        damage = self._border_white_mask(
+            arr, thresh=max(245.0, 0.98 * float(gray.max())))
+        damage = self._box_blur(damage.astype(np.float64), dmg_rad) > 0
+        dh, dw = damage.shape
+
+        for _, peak in peaks:
+            for variant in self.GEOM_VARIANTS:
+                p = dict(peak)
+                for key, dv in variant.items():
+                    p[key] = p[key] * dv if key == 'scale' else p[key] + dv
+                    if key == 'aspect':
+                        p[key] = min(max(p[key], 0.3), 1.0)
+                vals, xs, ys, valid = self._sample_cells(resp_s, p)
+                if int(valid.sum()) < 0.35 * N_PHYSICAL:
+                    continue
+                xi = np.clip(np.round(xs).astype(np.int64), 0, dw - 1)
+                yi = np.clip(np.round(ys).astype(np.int64), 0, dh - 1)
+                raw = self._classify(vals, valid, damage[yi, xi])
+                if raw is not None:
+                    yield raw
     def _extract_payload(self, logical, logical_erased, payload_len=None):
         """Metadata-guided decode. If payload_len is None, read it from
         the metadata region of the logical stream."""

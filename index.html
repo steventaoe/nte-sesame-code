@@ -44,6 +44,17 @@ input:focus{border-color:var(--pink)}
 .hidden{display:none}
 .status{font-size:0.85em;color:#A07080;margin-top:10px;min-height:1.2em}
 canvas{image-rendering:auto}
+.cam-overlay{position:fixed;inset:0;background:#000;z-index:100;display:flex;flex-direction:column}
+.cam-stage{position:relative;flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.cam-stage video{width:100%;height:100%;object-fit:cover}
+.cam-guide{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(78vw,78vh);aspect-ratio:1;border:2px solid rgba(255,255,255,.55);border-radius:50%;pointer-events:none;box-shadow:0 0 0 100vmax rgba(0,0,0,.28)}
+.cam-hint{position:absolute;left:0;right:0;bottom:12px;text-align:center;color:#fff;font-size:.82em;text-shadow:0 1px 4px #000;pointer-events:none}
+.cam-bar{display:flex;align-items:center;justify-content:center;gap:18px;padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:#111}
+.cam-btn{width:52px;height:52px;border-radius:50%;border:2px solid #fff;background:rgba(255,255,255,.16);color:#fff;font-size:1.25em;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.cam-btn:disabled{opacity:.35;cursor:not-allowed}
+.cam-btn.shutter{width:68px;height:68px;background:#fff}
+.cam-btn.on{background:var(--pink);border-color:var(--pink)}
+.cam-close{position:absolute;top:calc(10px + env(safe-area-inset-top));left:12px;z-index:2;width:40px;height:40px;border-radius:50%;border:none;background:rgba(0,0,0,.45);color:#fff;font-size:1.2em;cursor:pointer}
 @media(max-width:480px){.container{padding:12px}h1{font-size:1.3em}.panel{padding:16px}}
 </style>
 </head>
@@ -73,6 +84,11 @@ canvas{image-rendering:auto}
 </div>
 
 <div id="decode-panel" class="panel">
+  <div class="actions" style="margin-top:0;margin-bottom:16px">
+    <button class="btn" id="cam-btn" style="margin-top:0" onclick="openCamera()">摄像头实时扫描</button>
+    <label class="btn btn-secondary" for="capture-input" style="margin-top:0">拍照识别</label>
+    <input type="file" id="capture-input" accept="image/*" capture="environment" class="hidden" onchange="handleFile(this.files[0])">
+  </div>
   <div class="drop-zone" id="drop-zone">
     <input type="file" id="file-input" accept="image/*" onchange="handleFile(this.files[0])">
     <div class="icon">🍩</div>
@@ -85,6 +101,20 @@ canvas{image-rendering:auto}
   <div id="decode-status" class="status"></div>
   <div id="decode-result" class="result-box hidden"></div>
   <div id="decode-error" class="error-msg hidden"></div>
+</div>
+
+<div id="cam-overlay" class="cam-overlay hidden">
+  <div class="cam-stage">
+    <video id="cam-video" playsinline muted autoplay></video>
+    <div class="cam-guide" id="cam-guide"></div>
+    <p class="cam-hint" id="cam-hint">把贝果放进圆圈里，尽量正对镜头</p>
+    <button class="cam-close" onclick="closeCamera()">×</button>
+  </div>
+  <div class="cam-bar">
+    <button class="cam-btn on" id="cam-auto" onclick="toggleAutoScan()">自动</button>
+    <button class="cam-btn shutter" id="cam-shutter" onclick="captureStill()">拍摄</button>
+    <button class="cam-btn" id="cam-torch" onclick="toggleTorch()" disabled>补光</button>
+  </div>
 </div>
 
 <p class="info-text" style="text-align:center;margin-top:24px">
@@ -654,8 +684,8 @@ function encodeToCanvas(text, canvas) {
 // Decoder
 // ============================================================
 function decodeFromImage(imgElement) {
-  const w = imgElement.naturalWidth || imgElement.width;
-  const h = imgElement.naturalHeight || imgElement.height;
+  const w = imgElement.naturalWidth || imgElement.videoWidth || imgElement.width;
+  const h = imgElement.naturalHeight || imgElement.videoHeight || imgElement.height;
   const tmpCanvas = document.createElement('canvas');
   tmpCanvas.width = w; tmpCanvas.height = h;
   const tmpCtx = tmpCanvas.getContext('2d');
@@ -1071,11 +1101,170 @@ function doDecode() {
   try {
     const result = decodeFromImage(uploadedImage);
     if (result) {
-      resultDiv.innerHTML = `<p>解码结果:</p><a href="${escapeHtml(result)}" target="_blank" rel="noopener">${escapeHtml(result)}</a><div class="actions"><a class="btn btn-secondary" href="${escapeHtml(result)}" target="_blank" rel="noopener">跳转链接</a></div>`;
-      resultDiv.classList.remove('hidden'); status.textContent='解码成功!';
+      showResult(result);
+      status.textContent='解码成功!';
     } else { showError('decode-error','解码失败，无法识别芝码'); status.textContent=''; }
   } catch(e) { showError('decode-error',e.message); status.textContent=''; }
   btn.disabled=false;
+}
+
+function showResult(result) {
+  const resultDiv=document.getElementById('decode-result');
+  const safe=escapeHtml(result);
+  resultDiv.innerHTML = `<p>解码结果:</p><a href="${safe}" target="_blank" rel="noopener">${safe}</a><div class="actions"><a class="btn btn-secondary" href="${safe}" target="_blank" rel="noopener">跳转链接</a></div>`;
+  resultDiv.classList.remove('hidden');
+  document.getElementById('decode-error').classList.add('hidden');
+}
+
+// ============================================================
+// Camera capture
+//
+// Two paths, because they have very different support:
+//   * getUserMedia gives a live viewfinder, so the decoder can try many
+//     frames in a row -- a handheld shot is sharp and well framed only for
+//     a few frames out of every second, and retrying is what makes phone
+//     scanning actually work.
+//   * <input capture="environment"> hands off to the native camera app.
+//     No live scanning, but it needs no permission prompt and is the only
+//     option where getUserMedia is blocked (plain http, some in-app
+//     browsers).
+// ============================================================
+let camStream = null;
+let camTimer = null;
+let camBusy = false;
+let camAuto = true;
+let camTorchOn = false;
+let camFrames = 0;
+const camCanvas = document.createElement('canvas');
+const CAM_MAX_DIM = 1280;
+const CAM_INTERVAL_MS = 260;
+
+async function openCamera() {
+  const overlay=document.getElementById('cam-overlay');
+  const video=document.getElementById('cam-video');
+  const hint=document.getElementById('cam-hint');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showError('decode-error','当前浏览器不支持实时取景，请改用「拍照识别」');
+    document.getElementById('capture-input').click();
+    return;
+  }
+  overlay.classList.remove('hidden');
+  hint.textContent='正在请求摄像头权限...';
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{ facingMode:{ideal:'environment'},
+              width:{ideal:1920}, height:{ideal:1920} }
+    });
+  } catch(e) {
+    hint.textContent='';
+    overlay.classList.add('hidden');
+    showError('decode-error','无法打开摄像头: '+e.message+'。可改用「拍照识别」');
+    return;
+  }
+  video.srcObject = camStream;
+  try { await video.play(); } catch(e) { /* autoplay policy: muted+playsinline should allow it */ }
+  camFrames = 0;
+  hint.textContent='把贝果放进圆圈里，尽量正对镜头';
+  document.getElementById('cam-torch').disabled = !hasTorch();
+  scheduleScan(400);
+}
+
+function hasTorch() {
+  const t = camStream && camStream.getVideoTracks()[0];
+  if (!t || !t.getCapabilities) return false;
+  try { return !!t.getCapabilities().torch; } catch(e) { return false; }
+}
+
+async function toggleTorch() {
+  const t = camStream && camStream.getVideoTracks()[0];
+  if (!t) return;
+  camTorchOn = !camTorchOn;
+  try {
+    await t.applyConstraints({advanced:[{torch:camTorchOn}]});
+    document.getElementById('cam-torch').classList.toggle('on', camTorchOn);
+  } catch(e) { camTorchOn = false; }
+}
+
+function toggleAutoScan() {
+  camAuto = !camAuto;
+  document.getElementById('cam-auto').classList.toggle('on', camAuto);
+  if (camAuto) scheduleScan(0); else clearTimeout(camTimer);
+}
+
+function scheduleScan(delay) {
+  clearTimeout(camTimer);
+  camTimer = setTimeout(scanFrame, Math.max(0, delay));
+}
+
+function scanFrame() {
+  const video=document.getElementById('cam-video');
+  if (!camStream || camBusy) return;
+  if (!video.videoWidth || video.readyState < 2) { scheduleScan(CAM_INTERVAL_MS); return; }
+  if (!camAuto) return;
+
+  // Downscale once here rather than letting decodeFromImage allocate a
+  // full-resolution canvas per frame: the seed pitch is ~9px on a 1024px
+  // render, so 1280px still leaves several pixels per cell.
+  const s = Math.min(1, CAM_MAX_DIM / Math.max(video.videoWidth, video.videoHeight));
+  camCanvas.width = Math.round(video.videoWidth * s);
+  camCanvas.height = Math.round(video.videoHeight * s);
+  camCanvas.getContext('2d', {willReadFrequently:true}).drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
+
+  camBusy = true;
+  camFrames++;
+  // Decode is synchronous and can take a few hundred ms on a phone, so it
+  // goes on a task boundary to let the viewfinder paint first.
+  setTimeout(() => {
+    let result = null;
+    try { result = decodeFromImage(camCanvas); } catch(e) { /* no bagel in frame yet */ }
+    camBusy = false;
+    if (result) { onCameraSuccess(result); return; }
+    document.getElementById('cam-hint').textContent =
+      `未识别，正在重试… (第 ${camFrames} 帧)`;
+    scheduleScan(CAM_INTERVAL_MS);
+  }, 0);
+}
+
+function captureStill() {
+  const video=document.getElementById('cam-video');
+  if (!video.videoWidth) return;
+  camAuto = false;
+  clearTimeout(camTimer);
+  const s = Math.min(1, CAM_MAX_DIM / Math.max(video.videoWidth, video.videoHeight));
+  camCanvas.width = Math.round(video.videoWidth * s);
+  camCanvas.height = Math.round(video.videoHeight * s);
+  camCanvas.getContext('2d', {willReadFrequently:true}).drawImage(video, 0, 0, camCanvas.width, camCanvas.height);
+  document.getElementById('cam-hint').textContent='正在解码…';
+  let result = null;
+  try { result = decodeFromImage(camCanvas); } catch(e) { result = null; }
+  if (result) { onCameraSuccess(result); return; }
+  // Show the frozen frame so the user can see what the decoder saw.
+  uploadedImage = new Image();
+  uploadedImage.src = camCanvas.toDataURL('image/png');
+  document.getElementById('decode-img').src = uploadedImage.src;
+  document.getElementById('decode-preview').classList.remove('hidden');
+  document.getElementById('decode-btn').disabled = false;
+  closeCamera();
+  showError('decode-error','这一帧没能识别，可点「解码芝码」用已保存的画面重试，或换个角度重拍');
+}
+
+function onCameraSuccess(result) {
+  closeCamera();
+  showResult(result);
+  document.getElementById('decode-status').textContent = `解码成功! (扫描 ${camFrames} 帧)`;
+}
+
+function closeCamera() {
+  clearTimeout(camTimer);
+  camBusy = false;
+  if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+  const video=document.getElementById('cam-video');
+  video.srcObject = null;
+  camTorchOn = false;
+  document.getElementById('cam-torch').classList.remove('on');
+  document.getElementById('cam-guide').classList.remove('locked');
+  document.getElementById('cam-overlay').classList.add('hidden');
 }
 
 function showError(id, msg) {
