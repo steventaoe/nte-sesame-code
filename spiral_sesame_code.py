@@ -14,6 +14,7 @@
 import math
 import struct
 import hashlib
+from collections import namedtuple
 from typing import List, Optional
 
 import numpy as np
@@ -175,6 +176,72 @@ VERSION_TABLE = {
 # (inside the whitened stream, protected by REPEAT majority vote)
 METADATA_BYTES = 3
 
+# Density tiers ("芝码等级"). A coarse tier fuses an m×m block of grid cells
+# into one sesame, which buys scan distance -- what limits a phone camera is
+# the pitch on the sensor, and merging m×m cells multiplies it by m. Capacity
+# falls as ~1/m², so the redundancy has to move somewhere: it moves out of
+# REPEAT and RS and into the merge itself, since one m=3 sesame already covers
+# nine m=1 cell areas. That is why repeat and ec drop as merge rises; keeping
+# L0's REPEAT=5 and EC=30 at m=2 would leave exactly one byte of payload.
+# tier_id -> (merge, repeat, ec)
+TIER_TABLE = {
+    0: (1, 5, 30),   # 标准: 手持近扫, ~139 B
+    1: (2, 3, 20),   # 均衡: ~40 B
+    2: (3, 2, 8),    # 远距: ~29 B
+    3: (4, 1, 8),    # 超远: 墙面海报/大屏幕, ~33 B
+}
+DEFAULT_TIER = 0
+# ASCII on purpose: the CLI prints these, and a Windows console on a code page
+# that lacks CJK raises UnicodeEncodeError on the Chinese names (标准/均衡/
+# 远距/超远), which are the ones the README uses.
+TIER_NAMES = {0: 'standard', 1: 'balanced', 2: 'long-range', 3: 'extreme'}
+
+# The tier rides in the high bits of the version byte. version is 1..3 (2 bits)
+# and tier is 0..3 (2 bits), so the byte tops out at 15 with four bits spare.
+# tier=0 packs to exactly the byte today's codes already carry, which is what
+# keeps old renders decoding unchanged and new L0 renders byte-identical.
+TIER_SHIFT = 2
+VERSION_MASK = (1 << TIER_SHIFT) - 1
+
+
+def pack_version_byte(tier: int, version: int) -> int:
+    return (tier << TIER_SHIFT) | version
+
+
+def unpack_version_byte(vb: int):
+    return vb >> TIER_SHIFT, vb & VERSION_MASK
+
+
+TierGeometry = namedtuple('TierGeometry', [
+    'tier', 'merge', 'repeat', 'ec',
+    'cx', 'cy', 'outer_r', 'inner_r',
+    'grid', 'grid_count', 'n_logical', 'n_physical',
+])
+
+FrontEnd = namedtuple(
+    'FrontEnd', ['gray', 'prm', 'merge', 'arr', 'wide', 'f'])
+
+
+def tier_geometry(tier, image_size=(DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)):
+    """Full grid layout for one density tier at one image size."""
+    merge, repeat, ec = TIER_TABLE[tier]
+    w, h = image_size
+    cx, cy = w // 2, h // 2
+    outer_r, inner_r = get_ring_params(image_size)
+    grid = build_polar_grid(cx, cy, inner_r + 4, outer_r - 4,
+                            SESAME_SPACING * merge)
+    grid_count = len(grid)
+    n_logical = grid_count // repeat
+    return TierGeometry(tier, merge, repeat, ec, cx, cy, outer_r, inner_r,
+                        grid, grid_count, n_logical, n_logical * repeat)
+
+
+def tier_capacity(tier, image_size=(DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)):
+    """Payload bytes a tier holds, after the 13-byte framing overhead."""
+    g = tier_geometry(tier, image_size)
+    overhead = METADATA_BYTES + len(VERSION_HEADER) + 2 + 4 + g.ec
+    return max(0, g.n_logical // 8 - overhead)
+
 
 def get_ring_params(image_size):
     half = min(image_size) // 2
@@ -216,13 +283,12 @@ def build_polar_grid(cx, cy, inner_r, outer_r, spacing, fixed_count=None):
     return cells
 
 
-_canon_outer, _canon_inner = get_ring_params((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
-CANONICAL_GRID_COUNT = len(build_polar_grid(
-    DEFAULT_IMAGE_SIZE // 2, DEFAULT_IMAGE_SIZE // 2,
-    _canon_inner + 4, _canon_outer - 4, SESAME_SPACING))
-
-N_TOTAL_LOGICAL = CANONICAL_GRID_COUNT // REPEAT   # 1457
-N_PHYSICAL = N_TOTAL_LOGICAL * REPEAT              # 7285
+# L0 aliases. Every tier reads its numbers from tier_geometry(); these stay
+# only because the rest of the module was written against the L0 layout.
+_L0 = tier_geometry(DEFAULT_TIER)
+CANONICAL_GRID_COUNT = _L0.grid_count   # 7287
+N_TOTAL_LOGICAL = _L0.n_logical         # 1457
+N_PHYSICAL = _L0.n_physical             # 7285
 
 
 def whitening_sequence(n, seed=WHITEN_SEED):
@@ -245,6 +311,7 @@ class SesameRenderer:
     TIP_LEN = 6.0
     BODY_A = 4.5
     BODY_B = 2.8
+    HIGHLIGHT_BACK = 1.0   # bright highlight this far behind the centre
 
     def create_bagel(self, size, seed=42):
         w, h = size
@@ -308,16 +375,23 @@ class SesameRenderer:
             deg += step_deg
         return pts
 
-    def draw_sesame(self, draw, x, y, angle_to_center):
-        """Draw one white sesame seed at (x,y), tip aimed at the center."""
+    def draw_sesame(self, draw, x, y, angle_to_center, scale=1.0):
+        """Draw one white sesame seed at (x,y), tip aimed at the center.
+
+        `scale` multiplies the whole teardrop; a coarse density tier passes its
+        merge factor so one sesame still fills its m×m block of cells.
+        """
         ux, uy = math.cos(angle_to_center), math.sin(angle_to_center)
         body = self._teardrop_points(x, y, ux, uy,
-                                     self.TIP_LEN, self.BODY_A, self.BODY_B)
+                                     self.TIP_LEN * scale,
+                                     self.BODY_A * scale, self.BODY_B * scale)
         draw.polygon(body, fill=(240, 228, 190), outline=(205, 190, 145))
-        hx, hy = x - ux * 1.0, y - uy * 1.0
+        back = self.HIGHLIGHT_BACK * scale
+        hx, hy = x - ux * back, y - uy * back
         hl = self._teardrop_points(hx, hy, ux, uy,
-                                   self.TIP_LEN * 0.45,
-                                   self.BODY_A * 0.45, self.BODY_B * 0.42)
+                                   self.TIP_LEN * 0.45 * scale,
+                                   self.BODY_A * 0.45 * scale,
+                                   self.BODY_B * 0.42 * scale)
         draw.polygon(hl, fill=(252, 246, 222))
 
 
@@ -325,25 +399,31 @@ class SesameRenderer:
 
 class SpiralSesameEncoder:
     def __init__(self, image_size=(DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),
-                 ec_level=DEFAULT_EC, seed=DEFAULT_SEED):
+                 tier=DEFAULT_TIER, ec_level=None, seed=DEFAULT_SEED):
+        if tier not in TIER_TABLE:
+            raise ValueError(
+                f"Unknown tier: {tier} (valid: {sorted(TIER_TABLE)})")
+        geom = tier_geometry(tier, image_size)
+
         self.image_size = image_size
-        self.ec_level = ec_level
+        self.tier = tier
+        self.geom = geom
+        self.merge = geom.merge
+        self.repeat = geom.repeat
+        self.ec_level = geom.ec if ec_level is None else ec_level
         self.seed = seed
-        self.rs = ReedSolomon(nsym=ec_level)
+        self.rs = ReedSolomon(nsym=self.ec_level)
         self.renderer = SesameRenderer()
 
-        cx, cy = image_size[0] // 2, image_size[1] // 2
-        outer_r, inner_r = get_ring_params(image_size)
-        self.cx, self.cy = cx, cy
-        self.outer_r = outer_r
-        self.inner_r = inner_r
+        self.cx, self.cy = geom.cx, geom.cy
+        self.outer_r = geom.outer_r
+        self.inner_r = geom.inner_r
 
-        raw_grid = build_polar_grid(cx, cy, inner_r + 4, outer_r - 4, SESAME_SPACING)
-        self.grid = raw_grid
-        self.grid_count = len(raw_grid)
+        self.grid = geom.grid
+        self.grid_count = geom.grid_count
 
-        self.n_total_logical = self.grid_count // REPEAT
-        self.n_physical = self.n_total_logical * REPEAT
+        self.n_total_logical = geom.n_logical
+        self.n_physical = geom.n_physical
         self.whitening = whitening_sequence(self.n_total_logical)
 
     def capacity_bytes(self):
@@ -361,8 +441,9 @@ class SpiralSesameEncoder:
 
         version = select_version(len(data))
 
-        # Metadata: version(1B) + payload_length(2B)
-        metadata = struct.pack('>BH', version, len(data))
+        # Metadata: version+tier(1B) + payload_length(2B)
+        metadata = struct.pack('>BH', pack_version_byte(self.tier, version),
+                               len(data))
         meta_bits = []
         for byte in metadata:
             for i in range(7, -1, -1):
@@ -387,14 +468,14 @@ class SpiralSesameEncoder:
         # Whiten so sesame density stays ~50% regardless of payload
         whitened = [b ^ w for b, w in zip(logical, self.whitening)]
 
-        # Repeat each bit REPEAT times
+        # Repeat each bit `repeat` times
         physical_bits = []
         for b in whitened:
-            physical_bits.extend([b] * REPEAT)
+            physical_bits.extend([b] * self.repeat)
 
         # Sector-aware interleaving across the full grid
         interleaver = SectorInterleaver(self.grid, self.n_physical,
-                                        REPEAT, seed=self.seed)
+                                        self.repeat, seed=self.seed)
         scattered = interleaver.interleave(physical_bits)
 
         # Render: sesame ONLY where bit==1, tip aimed at the center
@@ -406,7 +487,7 @@ class SpiralSesameEncoder:
                 continue
             x, y, ri, ai = self.grid[i]
             angle = math.atan2(self.cy - y, self.cx - x)
-            self.renderer.draw_sesame(draw, x, y, angle)
+            self.renderer.draw_sesame(draw, x, y, angle, scale=self.merge)
 
         canvas = canvas.filter(ImageFilter.GaussianBlur(0.3))
         return canvas
@@ -414,20 +495,81 @@ class SpiralSesameEncoder:
 
 # ─── Decoder ─────────────────────────────────────────────────────────────
 
+class _TierState:
+    """Per-tier decoder state: the grid plus everything derived from it.
+
+    Cached per tier because the pose search re-samples the grid thousands of
+    times and the interleaver/whitening are pure functions of the tier.
+    """
+
+    def __init__(self, tier, seed, ec_override=None):
+        self.seed = seed
+        self.geom = tier_geometry(tier)
+        self.ec = self.geom.ec if ec_override is None else ec_override
+        self.rs = ReedSolomon(nsym=self.ec)
+        self.whitening = whitening_sequence(self.geom.n_logical)
+        self.grid = build_polar_grid(
+            self.geom.cx, self.geom.cy, self.geom.inner_r + 4,
+            self.geom.outer_r - 4, SESAME_SPACING * self.geom.merge,
+            fixed_count=self.geom.grid_count)
+        self._centers = None
+        self._interleaver = None
+        self._copies = None
+
+    @property
+    def centers(self):
+        if self._centers is None:
+            c = DEFAULT_IMAGE_SIZE / 2.0
+            g = self.grid
+            self._centers = np.array(
+                [[g[i][0] - c, g[i][1] - c]
+                 for i in range(self.geom.n_physical)], dtype=np.float64)
+        return self._centers
+
+    @property
+    def interleaver(self):
+        if self._interleaver is None:
+            self._interleaver = SectorInterleaver(
+                self.grid, self.geom.n_physical, self.geom.repeat,
+                seed=self.seed)
+        return self._interleaver
+
+    @property
+    def copies(self):
+        if self._copies is None:
+            self._copies = np.array(
+                self.interleaver.logical_to_physical, dtype=np.int64
+            ).reshape(self.geom.n_logical, self.geom.repeat)
+        return self._copies
+
+
 class SpiralSesameDecoder:
     # Presence thresholds: bagel surface patch-mean <= ~183, sesame ~215-235
     SESAME_PRESENT_MIN = 205
     SESAME_ABSENT_MAX = 192
 
-    def __init__(self, ec_level=DEFAULT_EC, seed=DEFAULT_SEED):
-        self.ec_level = ec_level
+    def __init__(self, ec_level=None, seed=DEFAULT_SEED):
         self.seed = seed
-        self.rs = ReedSolomon(nsym=ec_level)
-        self.whitening = whitening_sequence(N_TOTAL_LOGICAL)
-        self._grid_cache = None
-        self._centers = None
-        self._interleaver = None
-        self._repeat_groups = None
+        self._ec_override = ec_level
+        self._states = {}
+        self._st = None
+        self.set_tier(DEFAULT_TIER)
+
+    @property
+    def tier(self):
+        return self._st.geom.tier
+
+    def set_tier(self, tier):
+        """Point the decoder at one tier's grid, codec and whitening."""
+        st = self._states.get(tier)
+        if st is None:
+            st = _TierState(tier, self.seed, self._ec_override)
+            self._states[tier] = st
+        self._st = st
+        self.geom = st.geom
+        self.ec_level = st.ec
+        self.rs = st.rs
+        self.whitening = st.whitening
 
     def decode_image(self, img: Image.Image, try_hard=True) -> Optional[str]:
         result = self.decode_bytes(img, try_hard=try_hard)
@@ -442,25 +584,41 @@ class SpiralSesameDecoder:
         img = img.convert('RGB')
         arr = np.array(img)
 
-        deferred = []
-        for raw in self._pose_candidates(arr):
-            result = self._backend(raw, False)
+        fe = self._front_end_params(arr)
+        merge = fe.merge if fe is not None else None
+        for tier in self._tier_order(merge):
+            self.set_tier(tier)
+            deferred = []
+            if fe is not None:
+                for raw in self._pose_candidates(fe, tier):
+                    result = self._backend(raw, False)
+                    if result is not None:
+                        return result
+                    # The exhaustive backend sweeps every plausible payload
+                    # length, so it costs seconds per candidate. Only the
+                    # best-ranked poses are worth that; the rest are geometry
+                    # the cheap pass already rejected by a wide margin.
+                    if try_hard and len(deferred) < 4:
+                        deferred.append(raw)
+                for raw in deferred:
+                    result = self._backend(raw, True)
+                    if result is not None:
+                        return result
+            result = self._legacy_decode(img, arr, try_hard)
             if result is not None:
                 return result
-            # The exhaustive backend sweeps every plausible payload length,
-            # so it costs seconds per candidate. Only the best-ranked poses
-            # are worth that; the rest are geometry the cheap pass already
-            # rejected by a wide margin.
-            if try_hard and len(deferred) < 4:
-                deferred.append(raw)
-        for raw in deferred:
-            result = self._backend(raw, True)
-            if result is not None:
-                return result
+        # One line for the whole sweep. Reporting per candidate instead was
+        # already noisy, and the tier sweep multiplies every candidate by the
+        # number of tiers -- dozens of lines on an image that simply has no
+        # code in it.
+        print("[decode] All decode attempts failed")
+        return None
 
+    def _legacy_decode(self, img, arr, try_hard=True):
+        """Flat-render front end: the image is already frontal, so only the
+        center and scale have to be recovered."""
         circle = self._detect_bagel_circle(arr)
         if circle is None:
-            print("[decode] Failed to detect bagel circle")
             return None
 
         cx, cy, detected_outer_r, detected_inner_r = circle
@@ -475,43 +633,37 @@ class SpiralSesameDecoder:
             scale = (get_ring_params((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))[0]
                      / max(detected_outer_r, 1))
 
-        canon_cx = DEFAULT_IMAGE_SIZE // 2
-        canon_cy = DEFAULT_IMAGE_SIZE // 2
-        canon_outer_r, canon_inner_r = get_ring_params(
-            (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
-
         normalized = self._normalize_image(img, cx, cy, scale, DEFAULT_IMAGE_SIZE)
         narr = np.array(normalized)
 
         damage = self._border_white_mask(narr)
-
-        grid = self._grid()
-
-        raw_values = self._read_presence(narr, grid, damage)
+        raw_values = self._read_presence(narr, self._grid(), damage)
         return self._backend(raw_values, try_hard)
 
     def _backend(self, raw_values, try_hard=True):
         """Deinterleave -> majority vote -> de-whiten -> RS. Shared by both
         front ends so they can be tried in sequence."""
+        g = self._st.geom
         inter = self._interleave_obj()
-        src = np.empty(N_PHYSICAL, dtype=np.int8)
+        src = np.empty(g.n_physical, dtype=np.int8)
         src[:] = -1
-        n = min(N_PHYSICAL, len(raw_values))
+        n = min(g.n_physical, len(raw_values))
         for i in range(n):
             v = raw_values[i]
             if v is not None:
                 src[i] = v
-        ordered = np.full(N_PHYSICAL, -1, dtype=np.int8)
+        ordered = np.full(g.n_physical, -1, dtype=np.int8)
         ordered[inter.physical_to_logical[:n]] = src[:n]
 
-        groups = ordered.reshape(N_TOTAL_LOGICAL, REPEAT).astype(np.int16)
+        groups = ordered.reshape(g.n_logical, g.repeat).astype(np.int16)
         ones = (groups == 1).sum(axis=1)
         zeros = (groups == 0).sum(axis=1)
         nones = (groups < 0).sum(axis=1)
-        whit = np.fromiter(self.whitening, dtype=np.int16, count=N_TOTAL_LOGICAL)
+        whit = np.fromiter(self.whitening, dtype=np.int16, count=g.n_logical)
         b = np.where(ones > zeros, 1, np.where(zeros > ones, 0, whit))
         logical = (b ^ whit).tolist()
-        logical_erased = (nones >= 3).tolist()
+        # Erase a bit once so many copies are gone that no majority survives.
+        logical_erased = (nones > g.repeat // 2).tolist()
 
         result = self._extract_payload(logical, logical_erased)
         if result is not None:
@@ -538,29 +690,13 @@ class SpiralSesameDecoder:
     R0 = 467.0
 
     def _grid(self):
-        if self._grid_cache is None:
-            canon_outer_r, canon_inner_r = get_ring_params(
-                (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
-            self._grid_cache = build_polar_grid(
-                DEFAULT_IMAGE_SIZE // 2, DEFAULT_IMAGE_SIZE // 2,
-                canon_inner_r + 4, canon_outer_r - 4, SESAME_SPACING,
-                fixed_count=CANONICAL_GRID_COUNT)
-        return self._grid_cache
+        return self._st.grid
 
     def _interleave_obj(self):
-        if self._interleaver is None:
-            self._interleaver = SectorInterleaver(
-                self._grid(), N_PHYSICAL, REPEAT, seed=self.seed)
-        return self._interleaver
+        return self._st.interleaver
 
     def _cell_centers(self):
-        if self._centers is None:
-            grid = self._grid()
-            c = DEFAULT_IMAGE_SIZE / 2.0
-            self._centers = np.array(
-                [[grid[i][0] - c, grid[i][1] - c] for i in range(N_PHYSICAL)],
-                dtype=np.float64)
-        return self._centers
+        return self._st.centers
 
     @staticmethod
     def _box_blur(a, rad):
@@ -607,6 +743,96 @@ class SpiralSesameDecoder:
             return a - self._box_blur(a, 8)
         opened = self._mov_extreme(self._mov_extreme(a, k, True), k, False)
         return a - opened
+
+    @staticmethod
+    def _polar_rows(resp, cx, cy, scale, r0=172.0, r1=464.0, row_stride=2):
+        """Resample the response onto (radius, arc length) rows. In these
+        coordinates the seed lattice is a straight brick pattern, so the
+        tangential period of a row is exactly the cell pitch in pixels."""
+        rows = []
+        r = int(round(r0 * scale))
+        r_end = int(round(r1 * scale))
+        while r < r_end:
+            n = max(8, int(2 * math.pi * r))
+            th = np.arange(n) / float(r)
+            x = np.clip((cx + r * np.cos(th)).astype(np.int64),
+                        0, resp.shape[1] - 1)
+            y = np.clip((cy + r * np.sin(th)).astype(np.int64),
+                        0, resp.shape[0] - 1)
+            rows.append(resp[y, x])
+            r += row_stride
+        return rows
+
+    def _polar_ac(self, resp, cx, cy, scale):
+        """Tangential autocorrelation of the polar rows, per lag in pixels."""
+        rows = self._polar_rows(resp, cx, cy, scale)
+        if len(rows) < 8:
+            return None
+        n = min(len(r) for r in rows)
+        if n < 24:
+            return None
+        P = np.array([r[:n] for r in rows], dtype=np.float64)
+        P -= P.mean(axis=1, keepdims=True)
+        lag_max = int(40.0 * scale) + 2
+        ac = np.empty(lag_max)
+        for d in range(1, lag_max + 1):
+            u = P[:, :n - d]
+            v = P[:, d:]
+            den = math.sqrt(float((u * u).mean()) * float((v * v).mean()))
+            ac[d - 1] = float((u * v).mean()) / den if den > 1e-9 else 0.0
+        return ac
+
+    def _estimate_merge(self, resp, cx, cy, scale):
+        """Read the density tier off the image: the tangential autocorrelation
+        of the polar rows revives at the cell pitch (9*merge*scale px), because
+        seeds are narrower than their spacing. Radial structure cannot be used
+        for this -- a seed is ~10*merge px long on a 9*merge px ring pitch, so
+        consecutive rings overlap and the radial profile carries no period.
+        Returns None when the response is too degraded to show a period."""
+        ac = self._polar_ac(resp, cx, cy, scale)
+        if ac is None:
+            return None
+        lag_max = len(ac)
+        pitch = None
+        for i in range(1, lag_max - 1):
+            if ac[i] > 0.25 and ac[i] >= ac[i - 1] and ac[i] >= ac[i + 1]:
+                pitch = i + 1
+                break
+        if pitch is None:
+            return None
+        merge = int(round(pitch / (9.0 * scale)))
+        if merge < 1 or merge > 4:
+            return None
+        return merge
+
+    def _measure_pitch_scale(self, resp, cx, cy, scale, merge):
+        """Scale from the seed pitch itself, sub-pixel.
+
+        The rim conic reads the seed band's edge, which on a coarse tier is
+        made of few big blobs and comes out biased inward by 1.5-3% even once
+        it is blurred and iterated -- outside the pose refinement basin, and
+        enough to let a rotated alias out-score the true orientation. The
+        pitch is a direct ruler instead: interpolate the autocorrelation peak
+        to sub-pixel and divide by the canonical pitch. Only used for
+        merge >= 2, where the period is long enough for the interpolation to
+        beat the conic.
+        """
+        ac = self._polar_ac(resp, cx, cy, scale)
+        if ac is None:
+            return None
+        guess = 9.0 * merge * scale
+        lo = max(2, int(round(guess * 0.7)))
+        hi = min(len(ac) - 1, int(round(guess * 1.3)))
+        best = max(range(lo, hi + 1), key=lambda i: ac[i])
+        if best < 1 or best >= len(ac) - 1 or ac[best] < 0.15:
+            return None
+        a, b, c = ac[best - 1], ac[best], ac[best + 1]
+        den = a - 2 * b + c
+        off = 0.5 * (a - c) / den if abs(den) > 1e-9 else 0.0
+        if off < -1.0 or off > 1.0:
+            off = 0.0
+        pitch = best + 1 + off
+        return pitch / (9.0 * merge)
 
     def _project(self, prm, pts):
         """Canonical cell coords -> image coords under the fitted pose."""
@@ -684,29 +910,33 @@ class SpiralSesameDecoder:
         return float(best_t), (best_eta / var if var > 1e-12 else -1.0)
 
     def _copies(self):
-        """Physical indices of the REPEAT copies of every logical bit."""
-        if self._repeat_groups is None:
-            self._repeat_groups = np.array(
-                self._interleave_obj().logical_to_physical,
-                dtype=np.int64).reshape(N_TOTAL_LOGICAL, REPEAT)
-        return self._repeat_groups
+        """Physical indices of the repeat copies of every logical bit."""
+        return self._st.copies
 
     def _align_score(self, img, prm):
-        """Fraction of logical bits whose REPEAT copies all read the same.
+        """How well the pose explains the sampled cells.
 
-        Sample bimodality cannot see the absolute rotation: turning the grid
-        slides each ring tangentially, so every cell still lands on either a
-        seed or bare dough and the samples stay just as bimodal -- an aliased
-        rotation can even out-score the true one. The copies of a logical bit
-        sit in different sectors, so a rotation shifts each of them by a
-        different number of cells and their agreement collapses. That makes
-        this the score that actually pins the rotation, and it is sharper than
-        bimodality on the rest of the pose too.
+        With REPEAT > 1 the score is the fraction of logical bits whose copies
+        all read the same. Sample bimodality cannot see the absolute rotation:
+        turning the grid slides each ring tangentially, so every cell still
+        lands on either a seed or bare dough and the samples stay just as
+        bimodal -- an aliased rotation can even out-score the true one. The
+        copies of a logical bit sit in different sectors, so a rotation shifts
+        each of them by a different number of cells and their agreement
+        collapses. That makes this the score that actually pins the rotation,
+        and it is sharper than bimodality on the rest of the pose too.
+
+        A REPEAT=1 tier has no copies, so agreement is identically 1 and says
+        nothing. Such a tier falls back to bimodality, which at least ranks the
+        rest of the pose; its rotation is recovered by decoding a full turn
+        instead (see `_pose_candidates`).
         """
         vals, _, _, valid = self._sample_cells(img, prm)
-        thr, _ = self._otsu(vals)
+        thr, eta = self._otsu(vals)
         if thr is None:
             return -1.0
+        if self._st.geom.repeat <= 1:
+            return eta
         bits = np.where(valid, (vals > thr).astype(np.float64), np.nan)
         g = bits[self._copies()]
         g = g[np.all(np.isfinite(g), axis=1)]
@@ -1019,7 +1249,7 @@ class SpiralSesameDecoder:
         (0.5, 0.25, 0.004),
     ]
 
-    def _coarse_pose(self, resp_s, prm, k_phi=3):
+    def _coarse_pose(self, resp_s, prm, k_phi=3, slack=(0.85, 1.18)):
         """Snap the disc-moment pose onto the alignment optimum.
 
         Center and scale are searched jointly on a grid rather than one axis
@@ -1050,7 +1280,7 @@ class SpiralSesameDecoder:
             # The ring grid is radially self-similar, so half/double scale
             # also lands on seeds; the disc radius from _localize rules
             # those harmonics out.
-            p['scale'] = min(max(p['scale'], 0.85 * s0), 1.18 * s0)
+            p['scale'] = min(max(p['scale'], slack[0] * s0), slack[1] * s0)
             return p, self._align_score(resp_s, p)
 
         def geom_rounds(best, score):
@@ -1130,6 +1360,27 @@ class SpiralSesameDecoder:
         {'aspect': 0.004}, {'aspect': -0.004},
         {'kx': 0.02}, {'ky': 0.02}, {'kx': -0.02}, {'ky': -0.02},
     ]
+    # A coarse tier's scale comes from the seed pitch, which is good to well
+    # under 1% -- but only when the autocorrelation peak clears its guard.
+    # When it does not, the rim conic is the fallback and reads inward by
+    # 1.5-3%, outside the refinement basin. Extra scale variants cover that
+    # fallback; m=1 keeps the tight set because its conic is already accurate.
+    #
+    # Rotation variants are coarse-tier only for the same reason. Fewer cells
+    # per ring means a given rotation shifts each ring by a smaller fraction of
+    # its pitch, so the agreement peak sits closer to the truth but the window
+    # that actually decodes narrows to ~2 deg -- and the peak can land a degree
+    # outside it.
+    COARSE_GEOM_VARIANTS = [
+        {'scale': 1.02}, {'scale': 0.98}, {'scale': 1.04}, {'scale': 0.96},
+        {'scale': 1.06}, {'scale': 0.94},
+    ] + [{'phi': d * math.pi / 180.0}
+         for d in (-2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0)]
+
+    def _geom_variants(self, merge):
+        if merge <= 1:
+            return self.GEOM_VARIANTS
+        return self.GEOM_VARIANTS + self.COARSE_GEOM_VARIANTS
 
     def _descend(self, resp_s, prm, score):
         for spec in self.DESCENT_ROUNDS:
@@ -1226,24 +1477,31 @@ class SpiralSesameDecoder:
         s0 = float(np.median(np.abs(below - m0)))
         s1 = float(np.median(np.abs(above - m1)))
         floor = 0.05 * gap
-        lo_cut = thresh - max(1.3 * s0, floor)
-        hi_cut = thresh + max(1.3 * s1, floor)
+        # The cuts hang off the modes, not off the Otsu threshold. On a coarse
+        # tier the upper mode is broad enough that Otsu splits at the low edge
+        # of the gap, and a threshold-relative band then slides under the zero
+        # mode, turning every absent seed into an erasure.
+        lo_cut = m0 + max(1.3 * s0, floor)
+        hi_cut = m1 - max(1.3 * s1, floor)
+        if lo_cut >= hi_cut:
+            return None
 
-        out_arr = np.empty(N_PHYSICAL, dtype=object)
+        out_arr = np.empty(len(vals), dtype=object)
         out_arr[:] = None
         usable = valid & (~hit)
         out_arr[usable & (vals > hi_cut)] = 1
         out_arr[usable & (vals < lo_cut)] = 0
         return out_arr.tolist()
 
-    def _pose_candidates(self, arr):
-        """Camera-robust front end. Yields cell readings for ranked pose
-        candidates; the caller decodes them in order and stops at the first
-        payload whose header and SHA-256 check out."""
+    def _front_end_params(self, arr):
+        """Tier-independent half of the camera front end: localize the seed
+        disc and read the density tier off the seed pitch. Returns a FrontEnd,
+        or None when there is no disc at all.
+        """
         gray = np.mean(arr.astype(np.float64), axis=2)
         h, w = gray.shape
         if min(h, w) < 40:
-            return
+            return None
 
         f = self.ANALYZE_MAX_DIM / float(max(h, w))
         if f < 1.0:
@@ -1255,25 +1513,155 @@ class SpiralSesameDecoder:
             f = 1.0
             a_gray = gray
 
-        a_resp = self._tophat(a_gray, 5)
-        prm, loc_score = self._localize(a_resp)
+        # A k=25 map keeps every tier's seeds -- opening with a big kernel
+        # erases small blobs too, so it passes them as well -- which is what
+        # the pitch measurement needs. k=5 stays the localization default
+        # because it rejects background texture a wide kernel would admit.
+        a_wide = self._tophat(a_gray, 25)
+        prm, loc_score = self._localize(self._tophat(a_gray, 5))
+        if prm is None:
+            prm, loc_score = self._localize(a_wide)
         if prm is None:
             print(f"[decode] pose: localization failed (score={loc_score:.3f})")
-            return
+            return None
+        # Merge detection only orders the tier sweep, so it is allowed to be
+        # wrong: the header check rejects a mismatched tier and the sweep moves
+        # on. The pitch lives in the wide map, so read it from that map's own
+        # localization first -- a k=5 fit on a coarse tier cancels the seeds
+        # and comes back with a center several pixels out, which is enough to
+        # hide the autocorrelation peak and report the tier as m=1.
+        merge = None
+        for base in (self._localize(a_wide)[0], prm):
+            if base is None:
+                continue
+            merge = self._estimate_merge(
+                a_wide, base['cx'], base['cy'], base['scale'])
+            if merge is not None:
+                break
+        if merge is None:
+            merge = 1
         prm['cx'] /= f
         prm['cy'] /= f
         prm['scale'] /= f
+        return FrontEnd(gray, prm, merge, arr, a_wide, f)
 
-        th_k = max(3, int(round(12.0 * prm['scale'])))
+    def _coarse_geometry(self, fe, prm, merge):
+        """Scale and center for a coarse tier, measured off the seed lattice.
+
+        No centroid of the seed band can work here. The lattice itself is
+        exactly centered -- the per-tier grid centroid offset is zero on all
+        four tiers -- so the bias comes from which cells happen to carry a
+        seed, i.e. from the payload. That puts the band centroid off the true
+        center by about R/sqrt(N/2): ~3 px at m=1 growing to ~13 px at m=4,
+        and measured worst case 7.8 px mean-weighted, 10.6 px on tier 3 no
+        matter the weighting. The rim, by contrast, is a circle and so is
+        payload-independent.
+
+        The rim only fails on a coarse tier because it is sampled by a few
+        hundred big blobs, which reads as a bumpy outline: an unblurred fit
+        comes back 5.7 px out with a 0.85 squeeze on a frontal shot. Blurring
+        the energy by three quarters of a cell pitch welds the blobs into a
+        continuous ring, and re-fitting from the fit's own center makes it a
+        fixed point. Measured over four tiers x rolls 0/15/30/45 x a native
+        and a half-resolution view, that lands the center within 2.9 px worst
+        case and 1.4 px on every tier below m=4; half a pitch leaves the ring
+        too bumpy at m=4 (7.4 px) and a full pitch overshoots into the hole.
+
+        Scale still comes from the pitch, not the rim: the blurred rim reads
+        inward by up to ~3%, and the spread depends on the view's sharpness in
+        a way the pitch does not. Re-measuring the pitch from the converged
+        center halves its error, worst case 0.36% against 0.9% from the
+        small-kernel start.
+
+        Runs per tier rather than once in `_front_end_params`, because merge
+        detection is only a guess used to order the sweep -- a coarse tier
+        whose pitch peak fell below the estimator's threshold still needs
+        these corrections.
+        """
+        wide, f = fe.wide, fe.f
+        cx, cy = prm['cx'] * f, prm['cy'] * f
+        scale = prm['scale'] * f
+        ps = self._measure_pitch_scale(wide, cx, cy, scale, merge)
+        if ps is not None:
+            scale = ps
+        outer_r, _ = get_ring_params((DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
+        rad = max(1, int(round(0.75 * SESAME_SPACING * merge * scale)))
+        e = self._box_blur(wide * wide, rad)
+        conic = None
+        for _ in range(3):
+            conic = self._edge_conic(e, cx, cy, 0.60 * scale * outer_r,
+                                     1.40 * scale * outer_r, True)
+            if conic is None:
+                break
+            cx, cy = conic[0], conic[1]
+        ps = self._measure_pitch_scale(wide, cx, cy, scale, merge)
+        if ps is not None:
+            scale = ps
+        out = dict(prm)
+        out['cx'], out['cy'] = cx / f, cy / f
+        # The blur that welds the rim into a ring also biases the fitted
+        # ellipse: on a dead-frontal coarse-tier shot it reads an aspect of
+        # 0.97-0.99, and a percent or two of squeeze along a random axis costs
+        # more alignment than any real tilt it could explain. Coarse tiers
+        # start level and leave the tilt to the pose refinement.
+        out['aspect'], out['theta'] = 1.0, 0.0
+        # The keystone has to go too, and for a sharper reason: it is
+        # inherited from `_localize`, whose small-kernel map cancels a coarse
+        # tier's seeds and reports a 0.71-0.89 squeeze on a frontal shot. That
+        # fake tilt sends `_fit_pose_conics` after keystone terms of up to
+        # 0.10, which compress one side of the grid by 10% -- five cell
+        # pitches at m=2, against a basin of a few pixels of center and a
+        # percent of scale. Nothing decodes from there, at any rotation.
+        out['kx'], out['ky'] = 0.0, 0.0
+        if ps is not None:
+            out['scale'] = scale / f
+        return out, ps is not None
+
+    def _tier_order(self, merge):
+        """Tiers to try, nearest to the measured pitch first. The header tier
+        still has to agree before a payload is accepted, so a wrong guess only
+        costs time, never correctness."""
+        if merge is None:
+            return list(sorted(TIER_TABLE))
+        est = merge - 1
+        return sorted(TIER_TABLE, key=lambda t: (abs(t - est), t))
+
+    def _pose_candidates(self, fe, tier):
+        """Camera-robust front end. Yields cell readings for ranked pose
+        candidates; the caller decodes them in order and stops at the first
+        payload whose header and SHA-256 check out."""
+        gray, prm, merge, arr = fe.gray, fe.prm, fe.merge, fe.arr
+        m = TIER_TABLE[tier][0]
+        pitch_scale = False
+        if m > 1:
+            prm, pitch_scale = self._coarse_geometry(fe, prm, m)
+
+        # The top-hat kernel has to sit between the seed and the bagel's own
+        # texture: smaller than a seed and it only reports the seed's outline,
+        # bigger than a texture clump and the clump reads as a seed. At L0
+        # that window is wide and 12x the cell pitch sits in it. On a coarse
+        # tier the seed grows with the merge but the texture does not, so the
+        # window closes from above -- at m=4 and native render resolution,
+        # 10x and 12x both admit texture and nothing decodes at any rotation,
+        # while 6x and 8x do. Coarse tiers take the smaller kernel.
+        th_mult = 12.0 if m <= 1 else 8.0
+        th_k = max(3, int(round(th_mult * m * prm['scale'])))
         resp = self._tophat(gray, th_k)
         # A quarter of the cell pitch: enough to average out grain inside a
         # cell, and it truncates to zero once cells are only a few pixels
         # across, where any blur at all smears seeds into their neighbours.
-        sm_rad = int(min(2.25 * prm['scale'], 28.0))
+        sm_rad = int(min(2.25 * m * prm['scale'], 28.0))
         resp_s = self._box_blur(resp, sm_rad)
 
-        prm, _ = self._coarse_pose(resp_s, prm)
-        _, peaks = self._refine_pose(resp_s, prm)
+        # A scale read off the seed pitch is good to well under 1%, so leave
+        # it almost no room. The wide harmonic guard is what lets a coarse tier
+        # fail here: agreement has aliases a couple of percent out, and from a
+        # center that is a few pixels off the search pays for the offset with
+        # scale, locks the pair together, and lands 2% out -- past the point
+        # where anything decodes.
+        slack = (0.99, 1.01) if pitch_scale else (0.85, 1.18)
+        geo = dict(prm)
+        prm, _ = self._coarse_pose(resp_s, prm, slack=slack)
 
         dmg_rad = max(2, int(round(3.0 * prm['scale'])))
         damage = self._border_white_mask(
@@ -1281,21 +1669,59 @@ class SpiralSesameDecoder:
         damage = self._box_blur(damage.astype(np.float64), dmg_rad) > 0
         dh, dw = damage.shape
 
-        for _, peak in peaks:
-            for variant in self.GEOM_VARIANTS:
-                p = dict(peak)
-                for key, dv in variant.items():
-                    p[key] = p[key] * dv if key == 'scale' else p[key] + dv
-                    if key == 'aspect':
-                        p[key] = min(max(p[key], 0.3), 1.0)
-                vals, xs, ys, valid = self._sample_cells(resp_s, p)
-                if int(valid.sum()) < 0.35 * N_PHYSICAL:
-                    continue
-                xi = np.clip(np.round(xs).astype(np.int64), 0, dw - 1)
-                yi = np.clip(np.round(ys).astype(np.int64), 0, dh - 1)
-                raw = self._classify(vals, valid, damage[yi, xi])
-                if raw is not None:
-                    yield raw
+        def reading(p):
+            vals, xs, ys, valid = self._sample_cells(resp_s, p)
+            if int(valid.sum()) < 0.35 * self._st.geom.n_physical:
+                return None
+            xi = np.clip(np.round(xs).astype(np.int64), 0, dw - 1)
+            yi = np.clip(np.round(ys).astype(np.int64), 0, dh - 1)
+            return self._classify(vals, valid, damage[yi, xi])
+
+        def with_variants(poses):
+            for pose in poses:
+                for variant in self._geom_variants(m):
+                    p = dict(pose)
+                    for key, dv in variant.items():
+                        p[key] = p[key] * dv if key == 'scale' else p[key] + dv
+                        if key == 'aspect':
+                            p[key] = min(max(p[key], 0.3), 1.0)
+                    raw = reading(p)
+                    if raw is not None:
+                        yield raw
+
+        if self._st.geom.repeat <= 1:
+            # Nothing pins the rotation: with a single copy, sample agreement
+            # is identically 1 and bimodality ranks a full turn almost flat
+            # (0.86 at the truth against 0.85 ten degrees out). So settle the
+            # geometry, then decode every degree of the turn and let the
+            # checksum arbitrate -- a coarse tier has only a few hundred cells,
+            # so a whole turn costs a fraction of a second.
+            #
+            # Sweep the measured geometry as well as the refined pose,
+            # measured first. A flat metric makes refinement a random
+            # walk, and it walked a decoding pose out of the basin at one
+            # image size in nine: the rim-and-pitch geometry alone decodes
+            # there, and nothing ranks the two well enough to pick between
+            # them.
+            refined, _ = self._descend(resp_s, prm,
+                                       self._align_score(resp_s, prm))
+            for base in (geo, refined):
+                for deg in np.arange(0.0, 360.0, 1.0):
+                    p = dict(base)
+                    p['phi'] = math.radians(float(deg))
+                    raw = reading(p)
+                    if raw is not None:
+                        yield raw
+            peaks = [p for _, p in
+                     self._phi_peaks(resp_s, refined, 1.0, 0.1, 3, 3.0)]
+            for raw in with_variants(peaks):
+                yield raw
+            return
+
+        _, peaks = self._refine_pose(resp_s, prm)
+        for raw in with_variants([p for _, p in peaks]):
+            yield raw
+
     def _extract_payload(self, logical, logical_erased, payload_len=None):
         """Metadata-guided decode. If payload_len is None, read it from
         the metadata region of the logical stream."""
@@ -1308,8 +1734,13 @@ class SpiralSesameDecoder:
             meta_bytes.append(val)
 
         if payload_len is None:
-            version = meta_bytes[0]
+            tier, version = unpack_version_byte(meta_bytes[0])
             payload_len = struct.unpack('>H', bytes(meta_bytes[1:3]))[0]
+            # The tier in the header is authoritative; a pose sampled with the
+            # wrong pitch cannot read these bits correctly anyway, and this
+            # check is what lets the auto-detect sweep reject a wrong guess.
+            if tier != self._st.geom.tier:
+                return None
             if version not in VERSION_TABLE:
                 return None
             if payload_len > VERSION_TABLE[version]:
@@ -1369,14 +1800,13 @@ class SpiralSesameDecoder:
     def _decode_exhaustive(self, logical, logical_erased):
         """Fallback: try all payload sizes when metadata is unreadable."""
         overhead_bytes = len(VERSION_HEADER) + 2 + 4 + self.ec_level
-        max_payload = N_TOTAL_LOGICAL // 8 - METADATA_BYTES - overhead_bytes
+        max_payload = (self._st.geom.n_logical // 8 - METADATA_BYTES
+                       - overhead_bytes)
 
         for payload_guess in range(5, min(250, max_payload) + 1):
             result = self._rs_decode_region(logical, logical_erased, payload_guess)
             if result is not None:
                 return result
-
-        print("[decode] All decode attempts failed")
         return None
 
     def _read_presence(self, arr, grid, damage=None):
@@ -1384,16 +1814,18 @@ class SpiralSesameDecoder:
         Cells that read bright but overlap border-connected white damage
         (torn/cropped regions) are treated as erasures, not as sesame."""
         h, w = arr.shape[:2]
+        pr = 2 * self._st.geom.merge
         values = []
         for x, y, ri, ai in grid:
             ix, iy = int(round(x)), int(round(y))
             if 0 <= iy < h and 0 <= ix < w:
-                patch = arr[max(0, iy - 2):iy + 3, max(0, ix - 2):ix + 3]
+                patch = arr[max(0, iy - pr):iy + pr + 1,
+                            max(0, ix - pr):ix + pr + 1]
                 brightness = float(np.mean(patch))
                 if brightness >= self.SESAME_PRESENT_MIN:
                     if damage is not None:
-                        dpatch = damage[max(0, iy - 2):iy + 3,
-                                        max(0, ix - 2):ix + 3]
+                        dpatch = damage[max(0, iy - pr):iy + pr + 1,
+                                        max(0, ix - pr):ix + pr + 1]
                         if dpatch.any():
                             values.append(None)
                             continue
@@ -1481,7 +1913,8 @@ class SpiralSesameDecoder:
 
         canon_outer_r, canon_inner_r = get_ring_params(
             (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE))
-        n_rings = max(1, int((canon_outer_r - canon_inner_r - 8) / SESAME_SPACING))
+        n_rings = max(1, int((canon_outer_r - canon_inner_r - 8)
+                             / (SESAME_SPACING * self._st.geom.merge)))
         step = (canon_outer_r - canon_inner_r - 8) / n_rings
         ring_r = [canon_inner_r + 4 + step * (k + 0.5) for k in range(n_rings)]
 
@@ -1686,25 +2119,29 @@ def main():
     enc.add_argument('text', help='Text to encode')
     enc.add_argument('-o', '--output', default='sesame_code.png')
     enc.add_argument('-s', '--size', type=int, default=DEFAULT_IMAGE_SIZE)
-    enc.add_argument('--ec', type=int, default=DEFAULT_EC)
+    enc.add_argument('--tier', type=int, default=DEFAULT_TIER,
+                     choices=sorted(TIER_TABLE),
+                     help='density tier; coarser tiers scan from farther away')
+    enc.add_argument('--ec', type=int, default=None,
+                     help='override the tier error-correction level')
     enc.add_argument('--seed', type=int, default=DEFAULT_SEED)
 
     dec = sub.add_parser('decode', help='Decode image to text')
     dec.add_argument('image', help='Input image path')
-    dec.add_argument('--ec', type=int, default=DEFAULT_EC)
+    dec.add_argument('--ec', type=int, default=None)
     dec.add_argument('--seed', type=int, default=DEFAULT_SEED)
 
     info = sub.add_parser('info', help='Show capacity info')
     info.add_argument('-s', '--size', type=int, default=DEFAULT_IMAGE_SIZE)
-    info.add_argument('--ec', type=int, default=DEFAULT_EC)
 
     args = parser.parse_args()
 
     if args.cmd == 'encode':
         enc_obj = SpiralSesameEncoder(
-            image_size=(args.size, args.size),
+            image_size=(args.size, args.size), tier=args.tier,
             ec_level=args.ec, seed=args.seed)
-        print(f"Capacity: {enc_obj.capacity_bytes()} bytes")
+        print(f"Tier: L{args.tier} ({TIER_NAMES[args.tier]}), "
+              f"capacity {enc_obj.capacity_bytes()} bytes")
         print(f"Grid cells: {len(enc_obj.grid)}")
         print(f"Encoding: \"{args.text}\" ({len(args.text.encode('utf-8'))} bytes)")
         img = enc_obj.encode_text(args.text)
@@ -1717,18 +2154,20 @@ def main():
         print(f"Decoding: {args.image} ({img.size})")
         result = dec_obj.decode_image(img)
         if result:
+            print(f"Tier: L{dec_obj.tier} ({TIER_NAMES[dec_obj.tier]})")
             print(f"Result: {result}")
         else:
             print("FAILED: Could not decode")
 
     elif args.cmd == 'info':
-        enc_obj = SpiralSesameEncoder(
-            image_size=(args.size, args.size), ec_level=args.ec)
+        size = (args.size, args.size)
+        row = "{:<6}{:<12}{:>6}{:>8}{:>5}{:>8}{:>10}".format
         print(f"Image size: {args.size}x{args.size}")
-        print(f"EC symbols: {args.ec}")
-        print(f"Repeat factor: {REPEAT}")
-        print(f"Grid cells: {len(enc_obj.grid)}")
-        print(f"Usable capacity: {enc_obj.capacity_bytes()} bytes")
+        print(row("tier", "name", "merge", "repeat", "ec", "cells", "cap(B)"))
+        for t in sorted(TIER_TABLE):
+            g = tier_geometry(t, size)
+            print(row(f"L{t}", TIER_NAMES[t], g.merge, g.repeat, g.ec,
+                      g.grid_count, tier_capacity(t, size)))
         print(f"Versions: {VERSION_TABLE}")
 
     else:
