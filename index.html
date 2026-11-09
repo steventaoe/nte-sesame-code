@@ -44,6 +44,16 @@ input:focus{border-color:var(--pink)}
 .raw-payload{margin:6px 0 0;padding:10px;background:#FFF6F8;border:1px solid #F0D8E0;border-radius:8px;font-size:0.85em;white-space:pre-wrap;word-break:break-all}
 .hidden{display:none}
 .status{font-size:0.85em;color:#A07080;margin-top:10px;min-height:1.2em}
+.tier-row{display:flex;gap:8px;margin-bottom:10px}
+.tier-chip{flex:1;padding:10px 4px;border:2px solid var(--border);border-radius:10px;background:var(--card);cursor:pointer;text-align:center;font-family:inherit;color:#A07080;transition:all .15s}
+.tier-chip .lv{display:block;font-size:1.05em;font-weight:700}
+.tier-chip .nm{display:block;font-size:0.75em;margin-top:2px}
+.tier-chip:hover{border-color:var(--pink-light)}
+.tier-chip.active{border-color:var(--pink);background:var(--pink);color:#fff}
+.tier-note{font-size:0.8em;color:#A08090;line-height:1.6;background:#FFF8FA;border:1px solid var(--border);border-radius:8px;padding:8px 12px}
+.tier-note b{color:var(--pink-dark)}
+.tier-note.over{background:#FFF0F0;border-color:#F0B8B8;color:#C33}
+.tier-note.over b{color:#C33}
 canvas{image-rendering:auto}
 .cam-overlay{position:fixed;inset:0;background:#000;z-index:100;display:flex;flex-direction:column}
 .cam-stage{position:relative;flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center}
@@ -73,6 +83,9 @@ canvas{image-rendering:auto}
   <label for="url-input">输入链接</label>
   <input type="url" id="url-input" placeholder="https://www.bilibili.com/video/BV1xx..." oninput="checkPlatform()">
   <div id="platform-tag"></div>
+  <label style="margin-top:16px">芝码等级</label>
+  <div class="tier-row" id="tier-row"></div>
+  <div class="tier-note" id="tier-note"></div>
   <button class="btn" id="encode-btn" onclick="doEncode()">生成芝码</button>
   <div id="encode-status" class="status"></div>
   <div id="encode-preview" class="preview-area hidden">
@@ -119,7 +132,7 @@ canvas{image-rendering:auto}
 </div>
 
 <p class="info-text" style="text-align:center;margin-top:24px">
-  支持 B站 / 小红书链接 · 容量最大约 139 字节<br>
+  支持 B站 / 小红书链接 · 四级密度，L0 容量 139 字节，L3 可远距离扫描<br>
   完全离线运行，数据不离开浏览器
 </p>
 </div>
@@ -372,6 +385,46 @@ const SESAME_PRESENT_MIN = 205;
 const SESAME_ABSENT_MAX = 192;
 const VERSION_TABLE = {1: 30, 2: 70, 3: 144};
 
+// Density tiers (芝码等级). A coarse tier fuses an m×m block of grid cells into
+// one sesame, which buys scan distance -- what limits a phone camera is the
+// pitch on the sensor, and merging m×m cells multiplies it by m. Capacity falls
+// as ~1/m², so the redundancy moves out of REPEAT and RS and into the merge
+// itself, since one m=3 sesame already covers nine m=1 cell areas. That is why
+// repeat and ec drop as merge rises; keeping L0's REPEAT=5 and EC=30 at m=2
+// would leave exactly one byte of payload.
+// tier_id -> [merge, repeat, ec]
+const TIER_TABLE = {
+  0: [1, 5, 30],   // 标准: 手持近扫
+  1: [2, 3, 20],   // 均衡
+  2: [3, 2, 8],    // 远距
+  3: [4, 1, 8]     // 超远: 墙面海报 / 大屏幕
+};
+const TIER_IDS = [0, 1, 2, 3];
+const DEFAULT_TIER = 0;
+const TIER_NAMES = {0: '标准', 1: '均衡', 2: '远距', 3: '超远'};
+// What each tier trades away, for the picker's caption. Measured on rendered
+// PNGs: the smallest square that still decodes, and the widest white wedge
+// over the seed ring it survives.
+const TIER_NOTES = {
+  0: '手持近扫，抗遮挡最强',
+  1: '密度与距离折中',
+  2: '一米开外可扫',
+  3: '墙面海报 / 大屏幕'
+};
+const TIER_MIN_PX = {0: 180, 1: 220, 2: 120, 3: 120};
+const TIER_OCCL_DEG = {0: 60, 1: 60, 2: 30, 3: 10};
+
+// The tier rides in the high bits of the version byte. version is 1..3 and tier
+// is 0..3, so the byte tops out at 15 with four bits spare, and tier=0 packs to
+// exactly the byte today's codes already carry -- which is what keeps old
+// renders decoding unchanged and new L0 renders byte-identical.
+const TIER_SHIFT = 2;
+const VERSION_MASK = (1 << TIER_SHIFT) - 1;
+function packVersionByte(tier, version) { return (tier << TIER_SHIFT) | version; }
+function unpackVersionByte(b) {
+  return {tier: b >> TIER_SHIFT, version: b & VERSION_MASK};
+}
+
 function getRingParams(imageSize) {
   const half = Math.floor(imageSize / 2);
   return {
@@ -411,15 +464,34 @@ function buildPolarGrid(cx, cy, inner_r, outer_r, spacing, fixedCount) {
   return cells;
 }
 
-const _canonParams = getRingParams(DEFAULT_IMAGE_SIZE);
-const CANONICAL_GRID_COUNT = buildPolarGrid(
-  DEFAULT_IMAGE_SIZE / 2, DEFAULT_IMAGE_SIZE / 2,
-  _canonParams.inner_r + 4, _canonParams.outer_r - 4, SESAME_SPACING
-).length;
+// Full grid layout for one density tier at one image size. Cached: building the
+// L0 grid costs a few milliseconds and the decoder re-reads it per tier sweep.
+const _geomCache = new Map();
+function tierGeometry(tier, imageSize) {
+  if (imageSize === undefined) imageSize = DEFAULT_IMAGE_SIZE;
+  const key = tier * 100000 + imageSize;
+  let g = _geomCache.get(key);
+  if (g) return g;
+  const merge = TIER_TABLE[tier][0], repeat = TIER_TABLE[tier][1],
+        ec = TIER_TABLE[tier][2];
+  const cx = Math.floor(imageSize / 2), cy = cx;
+  const {outer_r, inner_r} = getRingParams(imageSize);
+  const grid = buildPolarGrid(cx, cy, inner_r + 4, outer_r - 4,
+                              SESAME_SPACING * merge);
+  const gridCount = grid.length;
+  const nLogical = Math.floor(gridCount / repeat);
+  g = {tier, merge, repeat, ec, cx, cy, outer_r, inner_r,
+       grid, gridCount, nLogical, nPhysical: nLogical * repeat};
+  _geomCache.set(key, g);
+  return g;
+}
 
-// Total physical cells used by encoder = floor(gridCount/REPEAT)*REPEAT
-const N_TOTAL_LOGICAL = Math.floor(CANONICAL_GRID_COUNT / REPEAT);
-const N_PHYSICAL = N_TOTAL_LOGICAL * REPEAT;
+// Payload bytes a tier holds, after the 13-byte framing overhead.
+function tierCapacity(tier, imageSize) {
+  const g = tierGeometry(tier, imageSize);
+  const overhead = METADATA_BYTES + VERSION_HEADER.length + 2 + 4 + g.ec;
+  return Math.max(0, Math.floor(g.nLogical / 8) - overhead);
+}
 
 function whiteningSequence(n) {
   const rng = seededRandom(WHITEN_SEED);
@@ -582,6 +654,7 @@ function drawBagel(ctx, size, cx, cy, outer_r, inner_r, seed) {
 const SESAME_TIP_LEN = 6.0;
 const SESAME_BODY_A = 4.5;
 const SESAME_BODY_B = 2.8;
+const SESAME_HIGHLIGHT_BACK = 1.0;   // bright highlight this far behind centre
 
 function teardropPoints(x, y, ux, uy, tipLen, a, b) {
   const vx = -uy, vy = ux;
@@ -603,41 +676,50 @@ function fillTeardrop(ctx, pts) {
   ctx.fill();
 }
 
-function drawSesame(ctx, x, y, angleToCenter) {
+// `scale` multiplies the whole teardrop; a coarse density tier passes its merge
+// factor so one sesame still fills its m×m block of cells.
+function drawSesame(ctx, x, y, angleToCenter, scale) {
+  if (scale === undefined) scale = 1.0;
   const ux = Math.cos(angleToCenter), uy = Math.sin(angleToCenter);
   ctx.fillStyle = 'rgb(240,228,190)';
-  fillTeardrop(ctx, teardropPoints(x, y, ux, uy, SESAME_TIP_LEN, SESAME_BODY_A, SESAME_BODY_B));
+  fillTeardrop(ctx, teardropPoints(x, y, ux, uy,
+    SESAME_TIP_LEN * scale, SESAME_BODY_A * scale, SESAME_BODY_B * scale));
   ctx.strokeStyle = 'rgb(205,190,145)';
   ctx.lineWidth = 1;
   ctx.stroke();
-  const hx = x - ux * 1.0, hy = y - uy * 1.0;
+  const back = SESAME_HIGHLIGHT_BACK * scale;
+  const hx = x - ux * back, hy = y - uy * back;
   ctx.fillStyle = 'rgb(252,246,222)';
   fillTeardrop(ctx, teardropPoints(hx, hy, ux, uy,
-    SESAME_TIP_LEN * 0.45, SESAME_BODY_A * 0.45, SESAME_BODY_B * 0.42));
+    SESAME_TIP_LEN * 0.45 * scale, SESAME_BODY_A * 0.45 * scale,
+    SESAME_BODY_B * 0.42 * scale));
 }
 
 // ============================================================
 // Encoder
 // ============================================================
-function encodeToCanvas(text, canvas) {
+function encodeToCanvas(text, canvas, tier) {
+  if (tier === undefined) tier = DEFAULT_TIER;
+  if (TIER_TABLE[tier] === undefined)
+    throw new Error(`未知芝码等级: ${tier}`);
+  const g = tierGeometry(tier);
   const data = new TextEncoder().encode(text);
   const sz = DEFAULT_IMAGE_SIZE;
-  const cx = sz/2, cy = sz/2;
-  const {outer_r, inner_r} = getRingParams(sz);
-  const rs = new RSCodec(DEFAULT_EC);
-  const grid = buildPolarGrid(cx, cy, inner_r+4, outer_r-4, SESAME_SPACING);
+  const cx = g.cx, cy = g.cy;
+  const rs = new RSCodec(g.ec);
+  const grid = g.grid;
 
-  const totalBytes = Math.floor(N_TOTAL_LOGICAL / 8);
-  const overhead = METADATA_BYTES + VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
-  const capacity = Math.max(0, totalBytes - overhead);
-  if (data.length > capacity) throw new Error(`数据过长: ${data.length} 字节, 最大 ${capacity}`);
+  const capacity = tierCapacity(tier);
+  if (data.length > capacity)
+    throw new Error(`数据过长: ${data.length} 字节, L${tier} 最大 ${capacity}`);
 
   let version = 0;
   for (const v of [1,2,3]) if (data.length <= VERSION_TABLE[v]) { version = v; break; }
   if (!version) throw new Error('数据过长');
 
-  // Metadata: version(1B) + length(2B)
-  const metaBytes = new Uint8Array([version, (data.length>>8)&0xFF, data.length&0xFF]);
+  // Metadata: version+tier(1B) + length(2B)
+  const metaBytes = new Uint8Array([packVersionByte(tier, version),
+                                    (data.length>>8)&0xFF, data.length&0xFF]);
   const metaBits = [];
   for (const b of metaBytes) for (let i = 7; i >= 0; i--) metaBits.push((b>>i)&1);
 
@@ -657,27 +739,28 @@ function encodeToCanvas(text, canvas) {
 
   // Combine meta + data + padding, then whiten for ~50% sesame density
   const allLogical = [...metaBits, ...dataBits];
-  while (allLogical.length < N_TOTAL_LOGICAL) allLogical.push(0);
-  const whit = whiteningSequence(N_TOTAL_LOGICAL);
-  for (let i = 0; i < N_TOTAL_LOGICAL; i++) allLogical[i] ^= whit[i];
+  while (allLogical.length < g.nLogical) allLogical.push(0);
+  allLogical.length = g.nLogical;
+  const whit = whiteningSequence(g.nLogical);
+  for (let i = 0; i < g.nLogical; i++) allLogical[i] ^= whit[i];
 
   // Repeat
   const physicalBits = [];
-  for (const b of allLogical) for (let r = 0; r < REPEAT; r++) physicalBits.push(b);
+  for (const b of allLogical) for (let r = 0; r < g.repeat; r++) physicalBits.push(b);
 
   // Interleave with full grid size (matching decoder)
-  const interleaver = new SectorInterleaver(grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
+  const interleaver = new SectorInterleaver(grid, g.nPhysical, g.repeat, DEFAULT_SEED);
   const scattered = interleaver.interleave(physicalBits);
 
   // Render: sesame ONLY where bit==1, tip aimed at the center
   canvas.width = sz; canvas.height = sz;
   const ctx = canvas.getContext('2d');
-  drawBagel(ctx, sz, cx, cy, outer_r, inner_r, DEFAULT_SEED);
+  drawBagel(ctx, sz, cx, cy, g.outer_r, g.inner_r, DEFAULT_SEED);
 
-  for (let i = 0; i < Math.min(N_PHYSICAL, grid.length); i++) {
+  for (let i = 0; i < Math.min(g.nPhysical, grid.length); i++) {
     if (scattered[i] !== 1) continue;
     const angle = Math.atan2(cy - grid[i].y, cx - grid[i].x);
-    drawSesame(ctx, grid[i].x, grid[i].y, angle);
+    drawSesame(ctx, grid[i].x, grid[i].y, angle, g.merge);
   }
 }
 
@@ -1061,37 +1144,53 @@ function clonePose(p) {
           theta: p.theta, phi: p.phi, kx: p.kx, ky: p.ky};
 }
 
-// Lazily built: the interleaver costs a few milliseconds and the encode path
-// never needs any of it.
+// Per-tier decoder state: the grid plus everything derived from it. Built
+// lazily and cached per tier, because the pose search re-samples the grid
+// thousands of times and the interleaver costs a few milliseconds. The encode
+// path never touches any of it.
+//
+// The hot loops below read `CAM.n` / `CAM.nLogical` / `CAM.repeat` into locals
+// rather than dereferencing per iteration: the pose search calls them millions
+// of times and a property load in a loop bound is not hoisted.
+const _camCache = new Map();
 const CAM = {
-  ready: false, _grid: null, _inter: null, _whit: null,
+  tier: -1, merge: 1, repeat: REPEAT, ec: DEFAULT_EC, n: 0, nLogical: 0,
+  _grid: null, _inter: null, _whit: null,
   qx: null, qy: null, xs: null, ys: null, vals: null, bits: null, copies: null,
-  init() {
-    if (this.ready) return;
-    this._grid = buildPolarGrid(DEFAULT_IMAGE_SIZE / 2, DEFAULT_IMAGE_SIZE / 2,
-                                getRingParams(DEFAULT_IMAGE_SIZE).inner_r + 4,
-                                getRingParams(DEFAULT_IMAGE_SIZE).outer_r - 4,
-                                SESAME_SPACING, CANONICAL_GRID_COUNT);
-    const half = DEFAULT_IMAGE_SIZE / 2;
-    this.qx = new Float64Array(N_PHYSICAL);
-    this.qy = new Float64Array(N_PHYSICAL);
-    for (let i = 0; i < N_PHYSICAL; i++) {
-      this.qx[i] = this._grid[i].x - half;
-      this.qy[i] = this._grid[i].y - half;
+  setTier(tier) {
+    if (this.tier === tier) return;
+    let st = _camCache.get(tier);
+    if (!st) {
+      const g = tierGeometry(tier);
+      st = {geom: g, grid: g.grid,
+            inter: new SectorInterleaver(g.grid, g.nPhysical, g.repeat,
+                                         DEFAULT_SEED),
+            whit: whiteningSequence(g.nLogical)};
+      const half = DEFAULT_IMAGE_SIZE / 2;
+      st.qx = new Float64Array(g.nPhysical);
+      st.qy = new Float64Array(g.nPhysical);
+      for (let i = 0; i < g.nPhysical; i++) {
+        st.qx[i] = g.grid[i].x - half;
+        st.qy[i] = g.grid[i].y - half;
+      }
+      st.xs = new Float64Array(g.nPhysical);
+      st.ys = new Float64Array(g.nPhysical);
+      st.vals = new Float64Array(g.nPhysical);
+      st.bits = new Int8Array(g.nPhysical);
+      st.copies = new Int32Array(g.nLogical * g.repeat);
+      for (let k = 0; k < g.nLogical; k++)
+        for (let r = 0; r < g.repeat; r++)
+          st.copies[k * g.repeat + r] = st.inter.logicalToPhys[k][r];
+      _camCache.set(tier, st);
     }
-    this.xs = new Float64Array(N_PHYSICAL);
-    this.ys = new Float64Array(N_PHYSICAL);
-    this.vals = new Float64Array(N_PHYSICAL);
-    this.bits = new Int8Array(N_PHYSICAL);
-    this._inter = new SectorInterleaver(this._grid, N_PHYSICAL, REPEAT, DEFAULT_SEED);
-    this._whit = whiteningSequence(N_TOTAL_LOGICAL);
-    this.copies = new Int32Array(N_TOTAL_LOGICAL * REPEAT);
-    for (let g = 0; g < N_TOTAL_LOGICAL; g++)
-      for (let r = 0; r < REPEAT; r++)
-        this.copies[g * REPEAT + r] = this._inter.logicalToPhys[g][r];
-    this.ready = true;
-  },
-  grid() { this.init(); return this._grid; }
+    const g = st.geom;
+    this.tier = tier;
+    this.merge = g.merge; this.repeat = g.repeat; this.ec = g.ec;
+    this.n = g.nPhysical; this.nLogical = g.nLogical;
+    this._grid = st.grid; this._inter = st.inter; this._whit = st.whit;
+    this.qx = st.qx; this.qy = st.qy; this.xs = st.xs; this.ys = st.ys;
+    this.vals = st.vals; this.bits = st.bits; this.copies = st.copies;
+  }
 };
 
 function projectAll(prm) {
@@ -1100,7 +1199,8 @@ function projectAll(prm) {
   const ct = Math.cos(prm.theta), st = Math.sin(prm.theta);
   const kx = prm.kx / R0, ky = prm.ky / R0;
   const asp = prm.aspect, sc = prm.scale, ox = prm.cx, oy = prm.cy;
-  for (let i = 0; i < N_PHYSICAL; i++) {
+  const n = CAM.n;
+  for (let i = 0; i < n; i++) {
     const px = qx[i], py = qy[i];
     let ux = px * cp - py * sp;
     let uy = px * sp + py * cp;
@@ -1122,8 +1222,8 @@ function projectAll(prm) {
 // the sampling itself.
 function sampleCells(img, w, h, vals) {
   const {xs, ys} = CAM;
-  const wLim = w - 1, hLim = h - 1;
-  for (let i = 0; i < N_PHYSICAL; i++) {
+  const wLim = w - 1, hLim = h - 1, n = CAM.n;
+  for (let i = 0; i < n; i++) {
     const X = xs[i], Y = ys[i];
     if (X < 0 || X >= wLim || Y < 0 || Y >= hLim) { vals[i] = NaN; continue; }
     const x0 = X | 0, y0 = Y | 0;
@@ -1181,31 +1281,40 @@ function otsuF(vals) {
   return {t: bestT, eta: vr > 1e-12 ? bestEta / vr : -1};
 }
 
-// Fraction of logical bits whose REPEAT copies all read the same.
+// How well the pose explains the sampled cells.
 //
-// Sample bimodality cannot see the absolute rotation: turning the grid slides
-// each ring tangentially, so every cell still lands on either a seed or bare
-// dough and the samples stay just as bimodal -- an aliased rotation can even
-// out-score the true one. The copies of a logical bit sit in different
-// sectors, so a rotation shifts each of them by a different number of cells
-// and their agreement collapses. That makes this the score that actually pins
-// the rotation.
+// With repeat > 1 the score is the fraction of logical bits whose copies all
+// read the same. Sample bimodality cannot see the absolute rotation: turning
+// the grid slides each ring tangentially, so every cell still lands on either a
+// seed or bare dough and the samples stay just as bimodal -- an aliased
+// rotation can even out-score the true one. The copies of a logical bit sit in
+// different sectors, so a rotation shifts each of them by a different number of
+// cells and their agreement collapses. That makes this the score that actually
+// pins the rotation.
+//
+// A repeat=1 tier has no copies, so agreement is identically 1 and says
+// nothing. Such a tier falls back to bimodality, which at least ranks the rest
+// of the pose; its rotation is recovered by decoding a full turn instead (see
+// cameraPoseCandidates).
 function alignScore(img, w, h, prm) {
   projectAll(prm);
   const vals = CAM.vals, bits = CAM.bits, copies = CAM.copies;
   sampleCells(img, w, h, vals);
   const o = otsuF(vals);
   if (!o) return -1;
+  const repeat = CAM.repeat;
+  if (repeat <= 1) return o.eta;
   const thr = o.t;
-  for (let i = 0; i < N_PHYSICAL; i++) {
+  const n = CAM.n, nLogical = CAM.nLogical;
+  for (let i = 0; i < n; i++) {
     const v = vals[i];
     bits[i] = v === v ? (v > thr ? 1 : 0) : -1;
   }
   let agree = 0, tot = 0;
-  for (let g = 0; g < N_TOTAL_LOGICAL; g++) {
-    const base = g * REPEAT;
+  for (let g = 0; g < nLogical; g++) {
+    const base = g * repeat;
     let mn = 2, mx = -2, finite = true;
-    for (let r = 0; r < REPEAT; r++) {
+    for (let r = 0; r < repeat; r++) {
       const b = bits[copies[base + r]];
       if (b < 0) { finite = false; break; }
       if (b < mn) mn = b;
@@ -1216,6 +1325,195 @@ function alignScore(img, w, h, prm) {
     if (mn === mx) agree++;
   }
   return tot < 64 ? -1 : agree / tot;
+}
+
+// ============================================================
+// Density-tier measurement
+// ============================================================
+
+// Resample the response onto (radius, arc length) rows. In these coordinates
+// the seed lattice is a straight brick pattern, so the tangential period of a
+// row is exactly the cell pitch in pixels. Radial structure cannot be used for
+// this: a seed is ~10*merge px long on a 9*merge px ring pitch, so consecutive
+// rings overlap and the radial profile carries no period.
+function polarRows(resp, w, h, cx, cy, scale, r0, r1, rowStride) {
+  if (r0 === undefined) r0 = 172.0;
+  if (r1 === undefined) r1 = 464.0;
+  if (rowStride === undefined) rowStride = 2;
+  const rows = [];
+  let r = Math.round(r0 * scale);
+  const rEnd = Math.round(r1 * scale);
+  const wLim = w - 1, hLim = h - 1;
+  while (r < rEnd) {
+    const n = Math.max(8, Math.trunc(2 * Math.PI * r));
+    const row = new Float64Array(n);
+    const invR = 1 / r;
+    for (let i = 0; i < n; i++) {
+      const th = i * invR;
+      // Truncate toward zero then clamp, which is what the Python side's
+      // .astype(int64) followed by np.clip does.
+      let x = (cx + r * Math.cos(th)) | 0;
+      let y = (cy + r * Math.sin(th)) | 0;
+      if (x < 0) x = 0; else if (x > wLim) x = wLim;
+      if (y < 0) y = 0; else if (y > hLim) y = hLim;
+      row[i] = resp[y * w + x];
+    }
+    rows.push(row);
+    r += rowStride;
+  }
+  return rows;
+}
+
+// Tangential autocorrelation of the polar rows, per lag in pixels.
+function polarAc(resp, w, h, cx, cy, scale) {
+  const rows = polarRows(resp, w, h, cx, cy, scale);
+  if (rows.length < 8) return null;
+  let n = Infinity;
+  for (const r of rows) if (r.length < n) n = r.length;
+  if (n < 24) return null;
+  const nr = rows.length;
+  const P = new Float64Array(nr * n);
+  for (let k = 0; k < nr; k++) {
+    const row = rows[k];
+    let mean = 0;
+    for (let i = 0; i < n; i++) mean += row[i];
+    mean /= n;
+    const o = k * n;
+    for (let i = 0; i < n; i++) P[o + i] = row[i] - mean;
+  }
+  const lagMax = Math.trunc(40.0 * scale) + 2;
+  const ac = new Float64Array(lagMax);
+  for (let d = 1; d <= lagMax; d++) {
+    let suu = 0, svv = 0, suv = 0, cnt = 0;
+    for (let k = 0; k < nr; k++) {
+      const o = k * n;
+      for (let i = 0; i < n - d; i++) {
+        const u = P[o + i], v = P[o + d + i];
+        suu += u * u; svv += v * v; suv += u * v; cnt++;
+      }
+    }
+    if (!cnt) continue;
+    const den = Math.sqrt((suu / cnt) * (svv / cnt));
+    ac[d - 1] = den > 1e-9 ? (suv / cnt) / den : 0.0;
+  }
+  return ac;
+}
+
+// Read the density tier off the image: the autocorrelation revives at the cell
+// pitch (9*merge*scale px), because seeds are narrower than their spacing.
+// Returns null when the response is too degraded to show a period.
+function estimateMerge(resp, w, h, cx, cy, scale) {
+  const ac = polarAc(resp, w, h, cx, cy, scale);
+  if (!ac) return null;
+  let pitch = null;
+  for (let i = 1; i < ac.length - 1; i++) {
+    if (ac[i] > 0.25 && ac[i] >= ac[i-1] && ac[i] >= ac[i+1]) { pitch = i + 1; break; }
+  }
+  if (pitch === null) return null;
+  const merge = Math.round(pitch / (9.0 * scale));
+  if (merge < 1 || merge > 4) return null;
+  return merge;
+}
+
+// Scale from the seed pitch itself, sub-pixel.
+//
+// The rim conic reads the seed band's edge, which on a coarse tier is made of
+// few big blobs and comes out biased inward by 1.5-3% even once it is blurred
+// and iterated -- outside the pose refinement basin, and enough to let a
+// rotated alias out-score the true orientation. The pitch is a direct ruler
+// instead: interpolate the autocorrelation peak to sub-pixel and divide by the
+// canonical pitch. Only used for merge >= 2, where the period is long enough
+// for the interpolation to beat the conic.
+function measurePitchScale(resp, w, h, cx, cy, scale, merge) {
+  const ac = polarAc(resp, w, h, cx, cy, scale);
+  if (!ac) return null;
+  const guess = 9.0 * merge * scale;
+  const lo = Math.max(2, Math.round(guess * 0.7));
+  const hi = Math.min(ac.length - 1, Math.round(guess * 1.3));
+  if (lo > hi) return null;
+  // Strict `>` keeps the first of equal maxima, matching Python's max().
+  let best = lo;
+  for (let i = lo + 1; i <= hi; i++) if (ac[i] > ac[best]) best = i;
+  if (best < 1 || best >= ac.length - 1 || ac[best] < 0.15) return null;
+  const a = ac[best-1], b = ac[best], c = ac[best+1];
+  const den = a - 2*b + c;
+  let off = Math.abs(den) > 1e-9 ? 0.5*(a-c)/den : 0.0;
+  if (off < -1.0 || off > 1.0) off = 0.0;
+  return (best + 1 + off) / (9.0 * merge);
+}
+
+// Scale and center for a coarse tier, measured off the seed lattice.
+//
+// No centroid of the seed band can work here. The lattice itself is exactly
+// centered -- the per-tier grid centroid offset is zero on all four tiers -- so
+// the bias comes from which cells happen to carry a seed, i.e. from the
+// payload. That puts the band centroid off the true center by about
+// R/sqrt(N/2): ~3 px at m=1 growing to ~13 px at m=4, and measured worst case
+// 10.6 px on tier 3 no matter the weighting. The rim, by contrast, is a circle
+// and so is payload-independent.
+//
+// The rim only fails on a coarse tier because it is sampled by a few hundred
+// big blobs, which reads as a bumpy outline: an unblurred fit comes back 5.7 px
+// out with a 0.85 squeeze on a frontal shot. Blurring the energy by three
+// quarters of a cell pitch welds the blobs into a continuous ring, and
+// re-fitting from the fit's own center makes it a fixed point. Measured over
+// four tiers x rolls 0/15/30/45 x a native and a half-resolution view, that
+// lands the center within 2.9 px worst case and 1.4 px on every tier below
+// m=4; half a pitch leaves the ring too bumpy at m=4 (7.4 px) and a full pitch
+// overshoots into the hole.
+//
+// Scale still comes from the pitch, not the rim: the blurred rim reads inward
+// by up to ~3%, and the spread depends on the view's sharpness in a way the
+// pitch does not. Re-measuring the pitch from the converged center halves its
+// error, worst case 0.36% against 0.9% from the small-kernel start.
+//
+// Runs per tier rather than once in frontEndParams, because merge detection is
+// only a guess used to order the sweep -- a coarse tier whose pitch peak fell
+// below the estimator's threshold still needs these corrections.
+function coarseGeometry(fe, prm, merge) {
+  const wide = fe.wide, aw = fe.aw, ah = fe.ah, f = fe.f;
+  let cx = prm.cx * f, cy = prm.cy * f, scale = prm.scale * f;
+  let ps = measurePitchScale(wide, aw, ah, cx, cy, scale, merge);
+  if (ps !== null) scale = ps;
+  const outerR = getRingParams(DEFAULT_IMAGE_SIZE).outer_r;
+  const rad = Math.max(1, Math.round(0.75 * SESAME_SPACING * merge * scale));
+  const sq = new Float64Array(aw * ah);
+  for (let i = 0; i < sq.length; i++) sq[i] = wide[i] * wide[i];
+  const e = boxBlurF(sq, aw, ah, rad);
+  for (let k = 0; k < 3; k++) {
+    const c = edgeConic(e, aw, ah, cx, cy,
+                        0.60 * scale * outerR, 1.40 * scale * outerR, true);
+    if (!c) break;
+    cx = c.cx; cy = c.cy;
+  }
+  ps = measurePitchScale(wide, aw, ah, cx, cy, scale, merge);
+  const out = clonePose(prm);
+  out.cx = cx / f; out.cy = cy / f;
+  // The blur that welds the rim into a ring also biases the fitted ellipse: on
+  // a dead-frontal coarse-tier shot it reads an aspect of 0.97-0.99, and a
+  // percent or two of squeeze along a random axis costs more alignment than
+  // any real tilt it could explain. Coarse tiers start level and leave the tilt
+  // to the pose refinement.
+  out.aspect = 1.0; out.theta = 0.0;
+  // The keystone has to go too, and for a sharper reason: it is inherited from
+  // localizeDisc, whose small-kernel map cancels a coarse tier's seeds and
+  // reports a 0.71-0.89 squeeze on a frontal shot. That fake tilt sends
+  // fitPoseConics after keystone terms of up to 0.10, which compress one side
+  // of the grid by 10% -- five cell pitches at m=2, against a basin of a few
+  // pixels of center and a percent of scale. Nothing decodes from there, at any
+  // rotation.
+  out.kx = 0.0; out.ky = 0.0;
+  if (ps !== null) { scale = ps; out.scale = scale / f; }
+  return {prm: out, pitchScale: ps !== null};
+}
+
+// Tiers to try, nearest to the measured pitch first. The header tier still has
+// to agree before a payload is accepted, so a wrong guess only costs time,
+// never correctness.
+function tierOrder(merge) {
+  if (merge === null || merge === undefined) return TIER_IDS.slice();
+  const est = merge - 1;
+  return TIER_IDS.slice().sort((a, b) => (Math.abs(a - est) - Math.abs(b - est)) || (a - b));
 }
 
 // Conic through the steepest radial transition of the seed energy between
@@ -1565,10 +1863,11 @@ const COARSE_ROUNDS = [
 // degrees, so it locks onto an alias and the geometry search that follows has
 // no basin left to find. So scan rotation first, and only when that lands
 // somewhere poor fall back to fixing the geometry first.
-function coarsePose(resp, w, h, prmIn, kPhi) {
+function coarsePose(resp, w, h, prmIn, kPhi, slack) {
   if (kPhi === undefined) kPhi = 3;
+  if (slack === undefined) slack = [0.85, 1.18];
   const s0 = prmIn.scale;
-  const lo = 0.85 * s0, hiS = 1.18 * s0;
+  const lo = slack[0] * s0, hiS = slack[1] * s0;
   // The ring grid is radially self-similar, so half/double scale also lands
   // on seeds; the disc radius from localizeDisc rules those harmonics out.
   function trySet(base, ov) {
@@ -1660,6 +1959,30 @@ const GEOM_VARIANTS = [
   {kx: 0.02}, {ky: 0.02}, {kx: -0.02}, {ky: -0.02}
 ];
 
+// A coarse tier's scale comes from the seed pitch, which is good to well under
+// 1% -- but only when the autocorrelation peak clears its guard. When it does
+// not, the rim conic is the fallback and reads inward by 1.5-3%, outside the
+// refinement basin. Extra scale variants cover that fallback; m=1 keeps the
+// tight set because its conic is already accurate.
+//
+// Rotation variants are coarse-tier only for the same reason. Fewer cells per
+// ring means a given rotation shifts each ring by a smaller fraction of its
+// pitch, so the agreement peak sits closer to the truth but the window that
+// actually decodes narrows to ~2 deg -- and the peak can land a degree outside
+// it.
+const COARSE_GEOM_VARIANTS = [
+  {scale: 1.02}, {scale: 0.98}, {scale: 1.04}, {scale: 0.96},
+  {scale: 1.06}, {scale: 0.94},
+  {phi: -2.0 * Math.PI / 180}, {phi: -1.5 * Math.PI / 180},
+  {phi: -1.0 * Math.PI / 180}, {phi: -0.5 * Math.PI / 180},
+  {phi: 0.5 * Math.PI / 180}, {phi: 1.0 * Math.PI / 180},
+  {phi: 1.5 * Math.PI / 180}, {phi: 2.0 * Math.PI / 180}
+];
+
+function geomVariants(merge) {
+  return merge <= 1 ? GEOM_VARIANTS : GEOM_VARIANTS.concat(COARSE_GEOM_VARIANTS);
+}
+
 function descendPose(resp, w, h, prmIn, scoreIn) {
   let prm = clonePose(prmIn), score = scoreIn;
   for (const spec of DESCENT_ROUNDS) {
@@ -1749,6 +2072,11 @@ function refinePose(resp, w, h, prmIn, kPeaks) {
 // eats the whole tail of the broader mode and skews the vote, while MAD scales
 // with the actual noise, so a blurry low-contrast shot widens it (more
 // erasures for RS to use) and a clean one keeps almost every cell decisive.
+//
+// The cuts hang off the modes, not off the Otsu threshold. On a coarse tier the
+// upper mode is broad enough that Otsu splits at the low edge of the gap, and a
+// threshold-relative band then slides under the zero mode, turning every absent
+// seed into an erasure.
 function classifyCells(vals, hit) {
   const o = otsuF(vals);
   if (!o) return null;
@@ -1768,10 +2096,12 @@ function classifyCells(vals, hit) {
   for (let i = 0; i < above.length; i++) a1[i] = Math.abs(above[i] - m1);
   const s0 = medianF(a0), s1 = medianF(a1);
   const floorV = 0.05 * gap;
-  const loCut = thr - Math.max(1.3 * s0, floorV);
-  const hiCut = thr + Math.max(1.3 * s1, floorV);
-  const out = new Array(N_PHYSICAL).fill(null);
-  for (let i = 0; i < N_PHYSICAL; i++) {
+  const loCut = m0 + Math.max(1.3 * s0, floorV);
+  const hiCut = m1 - Math.max(1.3 * s1, floorV);
+  if (loCut >= hiCut) return null;
+  const n = vals.length;
+  const out = new Array(n).fill(null);
+  for (let i = 0; i < n; i++) {
     if (hit[i]) continue;
     const v = vals[i];
     if (v !== v) continue;
@@ -1781,11 +2111,11 @@ function classifyCells(vals, hit) {
   return out;
 }
 
-// Yields cell readings for ranked pose candidates; the caller decodes them in
-// order and stops at the first payload whose header and SHA-256 check out.
-function* cameraPoseCandidates(gray, w, h) {
-  if (Math.min(h, w) < 40) return;
-  CAM.init();
+// Tier-independent half of the camera front end: localize the seed disc and
+// read the density tier off the seed pitch. Returns null when there is no disc
+// at all.
+function frontEndParams(gray, w, h) {
+  if (Math.min(h, w) < 40) return null;
 
   const f0 = ANALYZE_MAX_DIM / Math.max(h, w);
   let aGray, aw, ah, f;
@@ -1798,74 +2128,165 @@ function* cameraPoseCandidates(gray, w, h) {
     aGray = gray; aw = w; ah = h; f = 1.0;
   }
 
-  const loc = localizeDisc(tophatF(aGray, aw, ah, 5), aw, ah);
-  if (!loc) return;
-  const prm = loc.prm;
-  prm.cx /= f; prm.cy /= f; prm.scale /= f;
+  // A k=25 map keeps every tier's seeds -- opening with a big kernel erases
+  // small blobs too, so it passes them as well -- which is what the pitch
+  // measurement needs. k=5 stays the localization default because it rejects
+  // background texture a wide kernel would admit.
+  const wide = tophatF(aGray, aw, ah, 25);
+  const wideLoc = localizeDisc(wide, aw, ah);
+  const narrowLoc = localizeDisc(tophatF(aGray, aw, ah, 5), aw, ah);
+  const prm = narrowLoc ? narrowLoc.prm : (wideLoc ? wideLoc.prm : null);
+  if (!prm) return null;
 
-  const thK = Math.max(3, Math.round(12.0 * prm.scale));
+  // Merge detection only orders the tier sweep, so it is allowed to be wrong:
+  // the header check rejects a mismatched tier and the sweep moves on. The
+  // pitch lives in the wide map, so read it from that map's own localization
+  // first -- a k=5 fit on a coarse tier cancels the seeds and comes back with a
+  // center several pixels out, which is enough to hide the autocorrelation peak
+  // and report the tier as m=1.
+  let merge = null;
+  for (const base of [wideLoc ? wideLoc.prm : null, prm]) {
+    if (!base) continue;
+    merge = estimateMerge(wide, aw, ah, base.cx, base.cy, base.scale);
+    if (merge !== null) break;
+  }
+  if (merge === null) merge = 1;
+
+  prm.cx /= f; prm.cy /= f; prm.scale /= f;
+  return {gray, w, h, prm, merge, wide, aw, ah, f};
+}
+
+// Yields cell readings for ranked pose candidates; the caller decodes them in
+// order and stops at the first payload whose header and SHA-256 check out.
+function* cameraPoseCandidates(fe, tier) {
+  const gray = fe.gray, w = fe.w, h = fe.h;
+  const m = TIER_TABLE[tier][0];
+  let prm = fe.prm, pitchScale = false;
+  if (m > 1) {
+    const cg = coarseGeometry(fe, prm, m);
+    prm = cg.prm; pitchScale = cg.pitchScale;
+  }
+
+  // The top-hat kernel has to sit between the seed and the bagel's own texture:
+  // smaller than a seed and it only reports the seed's outline, bigger than a
+  // texture clump and the clump reads as a seed. At L0 that window is wide and
+  // 12x the cell pitch sits in it. On a coarse tier the seed grows with the
+  // merge but the texture does not, so the window closes from above -- at m=4
+  // and native render resolution, 10x and 12x both admit texture and nothing
+  // decodes at any rotation, while 6x and 8x do. Coarse tiers take the smaller
+  // kernel.
+  const thMult = m <= 1 ? 12.0 : 8.0;
+  const thK = Math.max(3, Math.round(thMult * m * prm.scale));
   const resp = tophatF(gray, w, h, thK);
-  // A quarter of the cell pitch: enough to average out grain inside a cell,
-  // and it truncates to zero once cells are only a few pixels across, where
-  // any blur at all smears seeds into their neighbours.
-  const smRad = Math.min(Math.trunc(2.25 * prm.scale), 28);
+  // A quarter of the cell pitch: enough to average out grain inside a cell, and
+  // it truncates to zero once cells are only a few pixels across, where any
+  // blur at all smears seeds into their neighbours.
+  const smRad = Math.min(Math.trunc(2.25 * m * prm.scale), 28);
   const respS = boxBlurF(resp, w, h, smRad);
 
-  const coarse = coarsePose(respS, w, h, prm);
-  const refined = refinePose(respS, w, h, coarse.best);
+  // A scale read off the seed pitch is good to well under 1%, so leave it
+  // almost no room. The wide harmonic guard is what lets a coarse tier fail
+  // here: agreement has aliases a couple of percent out, and from a center that
+  // is a few pixels off the search pays for the offset with scale, locks the
+  // pair together, and lands 2% out -- past the point where anything decodes.
+  const slack = pitchScale ? [0.99, 1.01] : [0.85, 1.18];
+  const geo = clonePose(prm);
+  prm = coarsePose(respS, w, h, prm, 3, slack).best;
 
-  const dmgRad = Math.max(2, Math.round(3.0 * coarse.best.scale));
+  const dmgRad = Math.max(2, Math.round(3.0 * prm.scale));
   let gmax = 0;
   for (let i = 0; i < gray.length; i++) if (gray[i] > gmax) gmax = gray[i];
   const wf = borderWhiteF(gray, w, h, Math.max(245.0, 0.98 * gmax));
   const dil = movExtremeF(Float64Array.from(wf), w, h, 2 * dmgRad + 1, false);
 
-  const vals = new Float64Array(N_PHYSICAL);
-  for (const pk of refined.peaks) {
-    for (const variant of GEOM_VARIANTS) {
-      const p = clonePose(pk.prm);
-      for (const key in variant) {
-        p[key] = key === 'scale' ? p[key] * variant[key] : p[key] + variant[key];
-        if (key === 'aspect') p[key] = Math.min(Math.max(p[key], 0.3), 1.0);
+  const n = CAM.n, xs = CAM.xs, ys = CAM.ys;
+  const vals = new Float64Array(n);
+  const hit = new Uint8Array(n);
+  const variants = geomVariants(m);
+
+  // `vals`, `hit` and the projected coordinates are all reused across poses:
+  // classifyCells copies out before the next call overwrites them.
+  function reading(p) {
+    projectAll(p);
+    sampleCells(respS, w, h, vals);
+    let nValid = 0;
+    for (let i = 0; i < n; i++) if (vals[i] === vals[i]) nValid++;
+    if (nValid < 0.35 * n) return null;
+    for (let i = 0; i < n; i++) {
+      let xi = (xs[i] + 0.5) | 0; if (xi < 0) xi = 0; else if (xi > w - 1) xi = w - 1;
+      let yi = (ys[i] + 0.5) | 0; if (yi < 0) yi = 0; else if (yi > h - 1) yi = h - 1;
+      hit[i] = dil[yi * w + xi] > 0 ? 1 : 0;
+    }
+    return classifyCells(vals, hit);
+  }
+  function variantPose(pose, variant) {
+    const p = clonePose(pose);
+    for (const key in variant) {
+      p[key] = key === 'scale' ? p[key] * variant[key] : p[key] + variant[key];
+      if (key === 'aspect') p[key] = Math.min(Math.max(p[key], 0.3), 1.0);
+    }
+    return p;
+  }
+
+  if (CAM.repeat <= 1) {
+    // Nothing pins the rotation: with a single copy, sample agreement is
+    // identically 1 and bimodality ranks a full turn almost flat (0.86 at the
+    // truth against 0.85 ten degrees out). So settle the geometry, then decode
+    // every degree of the turn and let the checksum arbitrate -- a coarse tier
+    // has only a few hundred cells, so a whole turn costs well under a second.
+    //
+    // Sweep the measured geometry as well as the refined pose, measured first.
+    // A flat metric makes refinement a random walk, and it walked a decoding
+    // pose out of the basin at one image size in nine: the rim-and-pitch
+    // geometry alone decodes there, and nothing ranks the two well enough to
+    // pick between them.
+    const refined = descendPose(respS, w, h, prm,
+                                alignScore(respS, w, h, prm)).prm;
+    for (const base of [geo, refined]) {
+      for (let deg = 0; deg < 360; deg++) {
+        const p = clonePose(base);
+        p.phi = deg * Math.PI / 180;
+        const raw = reading(p);
+        if (raw) yield raw;
       }
-      projectAll(p);
-      sampleCells(respS, w, h, vals);
-      let nValid = 0;
-      for (let i = 0; i < N_PHYSICAL; i++) if (vals[i] === vals[i]) nValid++;
-      if (nValid < 0.35 * N_PHYSICAL) continue;
-      const hit = new Uint8Array(N_PHYSICAL);
-      const {xs, ys} = CAM;
-      for (let i = 0; i < N_PHYSICAL; i++) {
-        let xi = (xs[i] + 0.5) | 0; if (xi < 0) xi = 0; else if (xi > w - 1) xi = w - 1;
-        let yi = (ys[i] + 0.5) | 0; if (yi < 0) yi = 0; else if (yi > h - 1) yi = h - 1;
-        hit[i] = dil[yi * w + xi] > 0 ? 1 : 0;
+    }
+    for (const pk of phiPeaks(respS, w, h, refined, 1.0, 0.1, 3, 3.0))
+      for (const variant of variants) {
+        const raw = reading(variantPose(pk.prm, variant));
+        if (raw) yield raw;
       }
-      const raw = classifyCells(vals, hit);
+    return;
+  }
+
+  for (const pk of refinePose(respS, w, h, prm).peaks)
+    for (const variant of variants) {
+      const raw = reading(variantPose(pk.prm, variant));
       if (raw) yield raw;
     }
-  }
 }
 
 // Deinterleave -> majority vote -> de-whiten -> RS. Shared by both front ends
 // so they can be tried in sequence.
 function backendDecode(rawValues, rs, tryHard) {
-  CAM.init();
+  const nPhys = CAM.n, nLogical = CAM.nLogical, repeat = CAM.repeat;
   const p2l = CAM._inter.physicalToLogical;
-  const ordered = new Array(N_PHYSICAL).fill(null);
-  const n = Math.min(N_PHYSICAL, rawValues.length);
+  const ordered = new Array(nPhys).fill(null);
+  const n = Math.min(nPhys, rawValues.length);
   for (let i = 0; i < n; i++) ordered[p2l[i]] = rawValues[i];
 
   const whit = CAM._whit;
-  const logical = new Array(N_TOTAL_LOGICAL), logicalErased = new Array(N_TOTAL_LOGICAL);
-  for (let g = 0; g < N_TOTAL_LOGICAL; g++) {
+  const logical = new Array(nLogical), logicalErased = new Array(nLogical);
+  // Erase a bit once so many copies are gone that no majority survives.
+  const eraseAt = Math.floor(repeat / 2) + 1;
+  for (let g = 0; g < nLogical; g++) {
     let ones = 0, zeros = 0, nones = 0;
-    for (let r = 0; r < REPEAT; r++) {
-      const v = ordered[g * REPEAT + r];
+    for (let r = 0; r < repeat; r++) {
+      const v = ordered[g * repeat + r];
       if (v === 1) ones++; else if (v === 0) zeros++; else nones++;
     }
     const b = ones > zeros ? 1 : (zeros > ones ? 0 : whit[g]);
     logical[g] = b ^ whit[g];
-    logicalErased[g] = nones >= 3;
+    logicalErased[g] = nones >= eraseAt;
   }
   const result = tryDecodeWithLogical(logical, logicalErased, rs);
   if (result) return result;
@@ -1875,6 +2296,10 @@ function backendDecode(rawValues, rs, tryHard) {
 // ============================================================
 // Decoder
 // ============================================================
+// Tier of the last successful decode, for the UI to report. Set by
+// decodePixels, which is the only entry point.
+let DECODED_TIER = null;
+
 // RGBA buffer in, decoded text out. This is the single entry point for every
 // decode path, and it is deliberately DOM-free so the whole block above the
 // `// UI` banner can be lifted verbatim into a worker.
@@ -1884,21 +2309,31 @@ function decodePixels(px, w, h, tryHard) {
   for (let i = 0, p = 0; i < gray.length; i++, p += 4)
     gray[i] = (px[p] + px[p + 1] + px[p + 2]) / 3;
 
-  const rs = new RSCodec(DEFAULT_EC);
-  const deferred = [];
-  for (const raw of cameraPoseCandidates(gray, w, h)) {
-    const r = backendDecode(raw, rs, false);
-    if (r) return r;
-    // The exhaustive backend sweeps every plausible payload length, so it
-    // costs seconds per candidate. Only the best-ranked poses are worth that;
-    // the rest are geometry the cheap pass already rejected by a wide margin.
-    if (tryHard && deferred.length < 4) deferred.push(raw);
+  const fe = frontEndParams(gray, w, h);
+  for (const tier of tierOrder(fe ? fe.merge : null)) {
+    CAM.setTier(tier);
+    const rs = new RSCodec(TIER_TABLE[tier][2]);
+    const deferred = [];
+    if (fe) {
+      for (const raw of cameraPoseCandidates(fe, tier)) {
+        const r = backendDecode(raw, rs, false);
+        if (r) { DECODED_TIER = tier; return r; }
+        // The exhaustive backend sweeps every plausible payload length, so it
+        // costs seconds per candidate. Only the best-ranked poses are worth
+        // that; the rest are geometry the cheap pass already rejected by a wide
+        // margin.
+        if (tryHard && deferred.length < 4) deferred.push(raw);
+      }
+      for (const raw of deferred) {
+        const r = backendDecode(raw, rs, true);
+        if (r) { DECODED_TIER = tier; return r; }
+      }
+    }
+    const legacy = decodeLegacy(px, w, h, rs, tryHard);
+    if (legacy) { DECODED_TIER = tier; return legacy; }
   }
-  for (const raw of deferred) {
-    const r = backendDecode(raw, rs, true);
-    if (r) return r;
-  }
-  return decodeLegacy(px, w, h, rs, tryHard);
+  DECODED_TIER = null;
+  return null;
 }
 
 // Pre-camera path: assumes the bagel is upright and roughly fills the frame.
@@ -1945,7 +2380,7 @@ function decodeLegacy(px, w, h, rs, tryHard) {
     return (cdata[i]+cdata[i+1]+cdata[i+2])/3;
   }
 
-  const grid = CAM.grid();
+  const grid = CAM._grid;
   const damage = borderWhiteMask(cdata, DEFAULT_IMAGE_SIZE);
   const rawValues = readPresence(grid, cBri, damage);
   return backendDecode(rawValues, rs, tryHard);
@@ -1953,15 +2388,20 @@ function decodeLegacy(px, w, h, rs, tryHard) {
 
 function tryDecodeWithLogical(logical, logicalErased, rs) {
   const metaBits = logical.slice(0, METADATA_BYTES * 8);
-  let v = 0, pl = 0;
-  for (let j = 0; j < 8; j++) v = (v<<1)|metaBits[j];
+  let vb = 0, pl = 0;
+  for (let j = 0; j < 8; j++) vb = (vb<<1)|metaBits[j];
   for (let j = 0; j < 16; j++) pl = (pl<<1)|metaBits[8+j];
-  if (!VERSION_TABLE[v] || pl > VERSION_TABLE[v]) return null;
+  // The header tier is authoritative, and this check is what lets the
+  // auto-detect sweep reject a wrong geometric guess: a pose sampled at the
+  // wrong pitch cannot read these bits correctly in the first place.
+  const {tier, version} = unpackVersionByte(vb);
+  if (tier !== CAM.tier) return null;
+  if (!VERSION_TABLE[version] || pl > VERSION_TABLE[version]) return null;
   return decodePayloadLogical(logical, logicalErased, rs, pl);
 }
 
 function decodePayloadLogical(logical, logicalErased, rs, payloadLen) {
-  const overheadBytes = VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
+  const overheadBytes = VERSION_HEADER.length + 2 + 4 + rs.nsym;
   const dataLogicalBytes = overheadBytes + payloadLen;
   const start = METADATA_BYTES * 8;
   const end = start + dataLogicalBytes * 8;
@@ -2004,8 +2444,8 @@ function decodePayloadLogical(logical, logicalErased, rs, payloadLen) {
 }
 
 function exhaustiveDecode(logical, logicalErased, rs) {
-  const overhead = VERSION_HEADER.length + 2 + 4 + DEFAULT_EC;
-  const maxPayload = Math.floor(N_TOTAL_LOGICAL/8) - METADATA_BYTES - overhead;
+  const overhead = VERSION_HEADER.length + 2 + 4 + rs.nsym;
+  const maxPayload = Math.floor(CAM.nLogical/8) - METADATA_BYTES - overhead;
   for (let guess = 5; guess <= Math.min(250, maxPayload); guess++) {
     const r = decodePayloadLogical(logical, logicalErased, rs, guess);
     if (r) return r;
@@ -2099,11 +2539,15 @@ function fitCircleRobust(points, maxIter=5) {
 
 function readPresence(grid, getBri, damage) {
   const S = DEFAULT_IMAGE_SIZE;
+  // A merged seed spans merge cells across, so the patch that has to contain
+  // it grows with the tier; sampling a fixed 5x5 window reads bare dough for
+  // anything coarser than L1.
+  const pr = 2 * CAM.merge;
   const values = [];
   for (const {x,y} of grid) {
     const ix=Math.round(x),iy=Math.round(y);
     let sum=0,cnt=0,dmg=false;
-    for (let dy=-2;dy<=2;dy++) for (let dx=-2;dx<=2;dx++) {
+    for (let dy=-pr;dy<=pr;dy++) for (let dx=-pr;dx<=pr;dx++) {
       const px=ix+dx,py=iy+dy;
       if (px>=0&&py>=0&&px<S&&py<S) {
         sum+=getBri(px,py); cnt++;
@@ -2179,7 +2623,7 @@ function estimateScaleFromRings(px, w, h, cx, cy, innerREst) {
   if (peaks.length < 8) return null;
 
   const cp = getRingParams(DEFAULT_IMAGE_SIZE);
-  const nRings = Math.max(1, Math.floor((cp.outer_r - cp.inner_r - 8) / SESAME_SPACING));
+  const nRings = Math.max(1, Math.floor((cp.outer_r - cp.inner_r - 8) / (SESAME_SPACING * CAM.merge)));
   const step = (cp.outer_r - cp.inner_r - 8) / nRings;
   const ringR = [];
   for (let k=0;k<nRings;k++) ringR.push(cp.inner_r + 4 + step*(k+0.5));
@@ -2230,6 +2674,66 @@ function checkPlatform() {
   else if (url.length > 0)
     tag.innerHTML = '<span class="platform-indicator platform-other">其他链接</span>';
   else tag.innerHTML = '';
+  updateTierNote();
+}
+
+// ------------------------------------------------------------
+// Density-tier picker
+//
+// The numbers in the note are read back out of tierCapacity() rather than
+// written into the markup, so the panel cannot drift from the codec.
+// ------------------------------------------------------------
+let selectedTier = DEFAULT_TIER;
+
+function buildTierRow() {
+  const row = document.getElementById('tier-row');
+  row.innerHTML = '';
+  for (const t of TIER_IDS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'tier-chip';
+    b.id = `tier-chip-${t}`;
+    b.onclick = () => selectTier(t);
+    const lv = document.createElement('span');
+    lv.className = 'lv';
+    lv.textContent = `L${t}`;
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = TIER_NAMES[t];
+    b.append(lv, nm);
+    row.appendChild(b);
+  }
+}
+
+function selectTier(t) {
+  selectedTier = t;
+  for (const k of TIER_IDS)
+    document.getElementById(`tier-chip-${k}`)
+      .classList.toggle('active', k === t);
+  updateTierNote();
+}
+
+function updateTierNote() {
+  const note = document.getElementById('tier-note');
+  const cap = tierCapacity(selectedTier);
+  const used = new TextEncoder()
+    .encode(document.getElementById('url-input').value.trim()).length;
+  const merge = TIER_TABLE[selectedTier][0];
+  note.innerHTML =
+    `${escapeHtml(TIER_NOTES[selectedTier])} · ` +
+    `容量 <b>${cap}</b> 字节 · 芝麻 ${merge}×${merge} 格 · ` +
+    `最小可扫 <b>${TIER_MIN_PX[selectedTier]}</b> px · ` +
+    `抗遮挡 <b>${TIER_OCCL_DEG[selectedTier]}°</b>` +
+    (used ? `<br>当前链接 <b>${used}</b> 字节` : '');
+  note.classList.toggle('over', used > cap);
+  if (used > cap) {
+    // Capacity falls as the tier number rises, so the fix is a *lower* tier --
+    // saying "更高等级" here would send the user the wrong way down the ladder.
+    const fits = TIER_IDS.filter(t => tierCapacity(t) >= used);
+    note.innerHTML += fits.length
+      ? ` — 超出 L${selectedTier} 容量，请改用 ${fits.map(t => 'L' + t).join(' / ')}`
+      : ` — 超出所有等级容量，请缩短链接`;
+  }
 }
 
 function doEncode() {
@@ -2240,8 +2744,9 @@ function doEncode() {
   btn.disabled=true; status.textContent='正在生成芝码...';
   errDiv.classList.add('hidden'); preview.classList.add('hidden');
   try {
-    encodeToCanvas(url, document.getElementById('output-canvas'));
-    preview.classList.remove('hidden'); status.textContent='生成完成!';
+    encodeToCanvas(url, document.getElementById('output-canvas'), selectedTier);
+    preview.classList.remove('hidden');
+    status.textContent=`生成完成! (L${selectedTier} ${TIER_NAMES[selectedTier]})`;
   } catch(e) { showError('encode-error',e.message); status.textContent=''; }
   btn.disabled=false;
 }
@@ -2288,22 +2793,24 @@ function doDecode() {
   let img;
   try { img = imagePixels(uploadedImage); }
   catch(e) { showError('decode-error',e.message); status.textContent=''; btn.disabled=false; return; }
-  decodePixelsAsync(img.data, img.width, img.height, true, result => {
-    if (result) { showResult(result); status.textContent='解码成功!'; }
+  decodePixelsAsync(img.data, img.width, img.height, true, (result, tier) => {
+    if (result) { showResult(result, tier); status.textContent='解码成功!'; }
     else { showError('decode-error','解码失败，无法识别芝码'); status.textContent=''; }
     btn.disabled=false;
   });
 }
 
-function showResult(result) {
+function showResult(result, tier) {
   const resultDiv=document.getElementById('decode-result');
   const safe=escapeHtml(result);
+  const badge = (tier === null || tier === undefined) ? ''
+    : `<span class="platform-indicator platform-bilibili">L${tier} ${escapeHtml(TIER_NAMES[tier] || '')}</span> `;
   // Only http(s) payloads become clickable. A decoded string is attacker-
   // controlled input -- anyone can print a bagel -- so anything else (plain
   // text, a hex dump of a non-UTF8 payload, a javascript: URL) is shown inert.
   resultDiv.innerHTML = isSafeHttpUrl(result)
-    ? `<p>解码结果:</p><a href="${safe}" target="_blank" rel="noopener">${safe}</a><div class="actions"><a class="btn btn-secondary" href="${safe}" target="_blank" rel="noopener">跳转链接</a></div>`
-    : `<p>解码结果:</p><pre class="raw-payload">${safe}</pre>`;
+    ? `<p>解码结果: ${badge}</p><a href="${safe}" target="_blank" rel="noopener">${safe}</a><div class="actions"><a class="btn btn-secondary" href="${safe}" target="_blank" rel="noopener">跳转链接</a></div>`
+    : `<p>解码结果: ${badge}</p><pre class="raw-payload">${safe}</pre>`;
   resultDiv.classList.remove('hidden');
   document.getElementById('decode-error').classList.add('hidden');
 }
@@ -2350,7 +2857,7 @@ onmessage = function (e) {
   const d = e.data;
   let result = null;
   try { result = decodePixels(d.px, d.w, d.h, d.tryHard); } catch (err) { result = null; }
-  postMessage({id: d.id, result: result});
+  postMessage({id: d.id, result: result, tier: DECODED_TIER});
 };
 `;
 
@@ -2363,7 +2870,9 @@ function getCodecWorker() {
   if (codecWorker || codecWorkerDead) return codecWorker;
   try {
     const full = document.getElementById('codec-src').textContent;
-    const ui = full.indexOf('\n// UI\n');
+    // Tolerate CRLF: git checks this file out with the platform's endings, and
+    // a literal '\n// UI\n' then never matches, silently killing the worker.
+    const ui = full.search(/\r?\n\/\/ UI\r?\n/);
     const cut = full.lastIndexOf('// =====', ui);
     if (ui < 0 || cut < 0) throw new Error('codec markers not found');
     const url = URL.createObjectURL(
@@ -2374,7 +2883,7 @@ function getCodecWorker() {
       const cb = decodePending.get(e.data.id);
       if (!cb) return;
       decodePending.delete(e.data.id);
-      cb(e.data.result);
+      cb(e.data.result, e.data.tier);
     };
     wk.onerror = () => {
       // Some strict CSPs and some browsers' file:// refuse blob workers; fall
@@ -2384,7 +2893,7 @@ function getCodecWorker() {
       wk.terminate();
       const stale = Array.from(decodePending.values());
       decodePending.clear();
-      for (const cb of stale) cb(null);
+      for (const cb of stale) cb(null, null);
     };
     codecWorker = wk;
   } catch (e) {
@@ -2400,7 +2909,7 @@ function decodePixelsAsync(px, w, h, tryHard, cb) {
     setTimeout(() => {
       let r = null;
       try { r = decodePixels(px, w, h, tryHard); } catch (e) { r = null; }
-      cb(r);
+      cb(r, DECODED_TIER);
     }, 0);
     return;
   }
@@ -2501,10 +3010,10 @@ function scanFrame() {
   // tryHard=false: the exhaustive backend costs seconds per candidate and the
   // next frame arrives in a fraction of that, so retrying cheaply beats
   // grinding on one bad frame.
-  decodePixelsAsync(frame.data, frame.width, frame.height, false, result => {
+  decodePixelsAsync(frame.data, frame.width, frame.height, false, (result, tier) => {
     camBusy = false;
     if (!camAuto || !camStream) return;   // overlay closed while we were working
-    if (result) { onCameraSuccess(result); return; }
+    if (result) { onCameraSuccess(result, tier); return; }
     document.getElementById('cam-hint').textContent =
       `未识别，正在重试… (第 ${camFrames} 帧)`;
     scheduleScan(CAM_INTERVAL_MS);
@@ -2523,8 +3032,8 @@ function captureStill() {
   frozen.getContext('2d').putImageData(frame, 0, 0);
   video.srcObject = null;
   document.getElementById('cam-hint').textContent='正在解码…';
-  decodePixelsAsync(frame.data, frame.width, frame.height, true, result => {
-    if (result) { onCameraSuccess(result); return; }
+  decodePixelsAsync(frame.data, frame.width, frame.height, true, (result, tier) => {
+    if (result) { onCameraSuccess(result, tier); return; }
     uploadedImage = new Image();
     uploadedImage.src = frozen.toDataURL('image/png');
     document.getElementById('decode-img').src = uploadedImage.src;
@@ -2535,9 +3044,9 @@ function captureStill() {
   });
 }
 
-function onCameraSuccess(result) {
+function onCameraSuccess(result, tier) {
   closeCamera();
-  showResult(result);
+  showResult(result, tier);
   document.getElementById('decode-status').textContent = `解码成功! (扫描 ${camFrames} 帧)`;
   // "抬手扫描即跳转": a scanned code is meant to be followed, not read. Only
   // http(s) payloads navigate -- anything else (arbitrary text, a hex dump of
@@ -2573,6 +3082,9 @@ function isSafeHttpUrl(s) {
   try { u = new URL(s); } catch (e) { return false; }
   return u.protocol === 'http:' || u.protocol === 'https:';
 }
+
+buildTierRow();
+selectTier(DEFAULT_TIER);
 </script>
 </body>
 </html>
